@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2017 GRNET S.A.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -13,8 +13,12 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import sys
 import json
 
+from django.conf import settings
+from django.utils.importlib import import_module
+from django.test.utils import override_settings
 from mock import patch, Mock
 from snf_django.utils.testing import BaseAPITest, mocked_quotaholder
 from synnefo.db.models_factory import (VolumeFactory, VolumeTypeFactory,
@@ -27,20 +31,31 @@ from copy import deepcopy
 VOLUME_URL = get_service_path(cyclades_services, 'volume',
                               version='v2.0')
 VOLUMES_URL = join_urls(VOLUME_URL, "volumes")
+SNAPSHOTS_URL = join_urls(VOLUME_URL, "snapshots")
 
 
 @patch("synnefo.logic.rapi_pool.GanetiRapiClient")
 class VolumeAPITest(BaseAPITest):
+    @override_settings(CYCLADES_DETACHABLE_DISK_TEMPLATES=("ext_vlmc",))
     def test_create_volume(self, mrapi):
         vm = VirtualMachineFactory(
             operstate="ACTIVE",
             flavor__volume_type__disk_template="ext_vlmc")
+        vt = VolumeTypeFactory(disk_template="ext_vlmc")
         user = vm.userid
         _data = {"display_name": "test_vol",
                  "size": 2,
-                 "server_id": vm.id}
+                 "volume_type": vt.id}
 
-        # Test Success
+        # Test standalone create success
+        mrapi().ModifyInstance.return_value = 42
+        with mocked_quotaholder():
+            r = self.post(VOLUMES_URL, user,
+                          json.dumps({"volume": _data}), "json")
+        self.assertSuccess(r)
+
+        # Test create and attach success
+        _data["server_id"] = vm.id
         mrapi().ModifyInstance.return_value = 42
         with mocked_quotaholder():
             r = self.post(VOLUMES_URL, user,
@@ -396,3 +411,33 @@ class SnapshotMetadataAPITest(BaseAPITest):
         self.assertSuccess(response)
         mimage().__enter__().remove_property.assert_called_with(
             snap_id, "key4")
+
+
+class SnapshotSettingsTest(BaseAPITest):
+    def reload_urlconf(self):
+        if 'synnefo.volume.urls' in sys.modules:
+            reload(sys.modules['synnefo.volume.urls'])
+        if settings.ROOT_URLCONF in sys.modules:
+            reload(sys.modules[settings.ROOT_URLCONF])
+        return import_module(settings.ROOT_URLCONF)
+
+    @override_settings(CYCLADES_SNAPSHOTS_ENABLED=False)
+    def test_snapshots_disabled(self):
+        self.reload_urlconf()
+        resp = self.get(SNAPSHOTS_URL)
+        self.assertEqual(resp.status_code, 400)
+
+    @override_settings(CYCLADES_SNAPSHOTS_ENABLED=True)
+    def test_snapshots_enabled(self):
+        self.reload_urlconf()
+        resp = self.get(SNAPSHOTS_URL)
+        self.assertEqual(resp.status_code, 200)
+
+    @override_settings(CYCLADES_SNAPSHOTS_ENABLED=['snapgroup'])
+    def test_snapshots_groups(self):
+        self.reload_urlconf()
+        resp = self.get(SNAPSHOTS_URL, 'user2')
+        self.assertEqual(resp.status_code, 501) # not implemented
+        resp = self.get(SNAPSHOTS_URL, 'user1',
+                        _roles=[{'id': '2', 'name': 'snapgroup'}])
+        self.assertEqual(resp.status_code, 200)

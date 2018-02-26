@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2016 GRNET S.A.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -19,8 +19,8 @@ from collections import OrderedDict
 from django.core.urlresolvers import reverse
 from django.utils.html import escape
 
-from synnefo.db.models import (VirtualMachine, Network, IPAddressLog, Volume,
-                               NetworkInterface, IPAddress)
+from synnefo.db.models import (VirtualMachine, Network, IPAddressHistory,
+                               Volume, NetworkInterface, IPAddress)
 from astakos.im.models import AstakosUser, Project
 from astakos.im import user_logic as users
 from astakos.im import transaction
@@ -116,6 +116,14 @@ class UserJSONView(AdminJSONView):
 
     def add_verbose_data(self, inst):
         extra_dict = OrderedDict()
+
+        if inst.email_change_is_pending():
+            extra_dict['pending_email'] = {
+                'display_name': "E-mail pending verification",
+                'value': inst.emailchanges.all()[0].new_email_address,
+                'visible': True,
+            }
+
         extra_dict['status'] = {
             'display_name': "Status",
             'value': inst.status_display,
@@ -163,15 +171,18 @@ JSON_CLASS = UserJSONView
 
 @has_permission_or_403(cached_actions)
 @transaction.commit_on_success
-def do_action(request, op, id):
+def do_action(request, op, id, data):
     """Apply the requested action on the specified user."""
-    user = get_user_or_404(id)
+    user = get_user_or_404(id, for_update=True)
     actions = get_permitted_actions(cached_actions, request.user)
 
     if op == 'reject':
         actions[op].apply(user, 'Rejected by the admin')
     elif op == 'contact':
         actions[op].apply(user, request)
+    elif op == 'modify_email':
+        if isinstance(data, dict):
+            actions[op].apply(user, data.get('new_email'))
     else:
         actions[op].apply(user)
 
@@ -222,7 +233,7 @@ def details(request, query):
     associations.append(IPAssociation(request, ip_list))
 
     vm_ids = VirtualMachine.objects.filter(userid=user.uuid).values('id')
-    ip_log_list = IPAddressLog.objects.filter(server_id__in=vm_ids)
+    ip_log_list = IPAddressHistory.objects.filter(user_id=user.uuid)
     associations.append(IPLogAssociation(request, ip_log_list))
 
     context = {

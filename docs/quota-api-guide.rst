@@ -49,7 +49,7 @@ Quotas
 
 The system specifies user quotas for each available resource. Resources
 can be allocated from various sources. By default, users get resources
-from their user-specific `system projects', which are identified by the same
+from their user-specific 'system projects', which are identified by the same
 uuid as the users. For each combination of user,
 source, and resource, the quota system keeps track of the maximum allowed
 value (limit) and the current actual usage. The former is controlled by
@@ -93,7 +93,7 @@ Status  Description
 
 **Example Successful Response**:
 
-.. code-block:: javascript
+.. code::
 
   {
       "system_project_id": {
@@ -165,7 +165,7 @@ Status  Description
 
 **Example Successful Response**:
 
-.. code-block:: javascript
+.. code::
 
   {
       "1a6165d0-5020-4b6d-a4ad-83476632a584": {

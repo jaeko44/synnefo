@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2016 GRNET S.A. and individual contributors
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -18,8 +18,7 @@ from archipelagomapper import ArchipelagoMapper
 
 class Mapper(object):
     """Mapper.
-       Required constructor parameters: mappath, namelen, hashtype.
-       Optional mappool.
+       Required constructor parameters: namelen.
     """
 
     def __init__(self, **params):
@@ -35,7 +34,3 @@ class Mapper(object):
     def map_stor(self, maphash, hashes, size, blocksize):
         """Store hashes in the given hashes map."""
         self.archip_map.map_stor(maphash, hashes, size, blocksize)
-
-    def map_copy(self, dst, src, size):
-        """Copies the src mapfile into the dst map file."""
-        self.archip_map.map_copy(dst, src, size)

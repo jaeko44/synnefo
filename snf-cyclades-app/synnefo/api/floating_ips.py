@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2017 GRNET S.A. and individual contributors
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -13,10 +13,11 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-from django.conf.urls.defaults import patterns
+from django.conf.urls import patterns
 from synnefo.db import transaction
+from django.conf import settings
 from django.http import HttpResponse
-from django.utils import simplejson as json
+import json
 
 from snf_django.lib import api
 from snf_django.lib.api import faults, utils
@@ -40,12 +41,65 @@ pools_urlpatterns = patterns(
 )
 '''
 
-ips_urlpatterns = patterns(
+
+def compute_ip_to_dict(floating_ip):
+    machine_id = None
+    if floating_ip.nic is not None:
+        machine_id = floating_ip.nic.machine_id
+    return {"fixed_ip": None,
+            "id": floating_ip.id,
+            "instance_id": str(machine_id) if machine_id else None,
+            "ip": floating_ip.address,
+            "pool": None}
+
+
+def ip_to_dict(floating_ip):
+    machine_id = None
+    port_id = None
+    if floating_ip.nic is not None:
+        machine_id = floating_ip.nic.machine_id
+        port_id = floating_ip.nic.id
+    return {"fixed_ip_address": None,
+            "id": str(floating_ip.id),
+            "instance_id": str(machine_id) if machine_id else None,
+            "floating_ip_address": floating_ip.address,
+            "port_id": str(port_id) if port_id else None,
+            "floating_network_id": str(floating_ip.network_id),
+            "user_id": floating_ip.userid,
+            "tenant_id": floating_ip.project,
+            "shared_to_project": floating_ip.shared_to_project,
+            "deleted": floating_ip.deleted}
+
+
+def _floatingip_details_view(floating_ip):
+    return json.dumps({'floatingip': ip_to_dict(floating_ip)})
+
+
+def _floatingip_list_view(floating_ips):
+    floating_ips = map(ip_to_dict, floating_ips)
+    return json.dumps({'floatingips': floating_ips})
+
+
+def _compute_floatingip_list_view(floating_ips):
+    floating_ips = map(compute_ip_to_dict, floating_ips)
+    return json.dumps({'floating_ips': floating_ips})
+
+
+def _compute_floatingip_details_view(floating_ip):
+    return json.dumps({'floating_ip': compute_ip_to_dict(floating_ip)})
+
+urlpatterns = patterns(
     'synnefo.api.floating_ips',
     (r'^(?:/|.json|.xml)?$', 'demux'),
     (r'^/detail(?:.json|.xml)?$', 'list_floating_ips', {'detail': True}),
     (r'^/(\w+)(?:/|.json|.xml)?$', 'floating_ip_demux'),
     (r'^/(\w+)/action(?:.json|.xml)?$', 'floating_ip_action_demux'),
+)
+
+compute_urlpatterns = patterns(
+    'synnefo.api.floating_ips',
+    (r'^(?:/|.json|.xml)?$', 'compute_demux'),
+    (r'^/(\w+)(?:/|.json|.xml)?$', 'compute_floating_ip_demux'),
 )
 
 
@@ -71,15 +125,41 @@ def floating_ip_demux(request, floating_ip_id):
                                           allowed_methods=['GET', 'DELETE'])
 
 
+def compute_demux(request):
+    if request.method == 'GET':
+        return list_floating_ips(request, _compute_floatingip_list_view)
+    elif request.method == 'POST':
+        return compute_allocate_floating_ip(request)
+    else:
+        return api.api_method_not_allowed(request,
+                                          allowed_methods=['GET', 'POST'])
+
+
+def compute_floating_ip_demux(request, floating_ip_id):
+    if request.method == 'GET':
+        return get_floating_ip(request, floating_ip_id)
+    elif request.method == 'DELETE':
+        return release_floating_ip(request, floating_ip_id)
+    else:
+        return api.api_method_not_allowed(request,
+                                          allowed_methods=['GET', 'DELETE'])
+
+
 @api.api_method(http_method='POST', user_required=True, logger=log,
                 serializations=["json"])
+@transaction.commit_on_success
 def floating_ip_action_demux(request, floating_ip_id):
     userid = request.user_uniq
     req = utils.get_json_body(request)
-    log.debug('floating_ip_action %s %s', floating_ip_id, req)
+
+    log.debug("User %s, Floating IP %s, Request: %s",
+              userid, floating_ip_id, req)
+
     if len(req) != 1:
         raise faults.BadRequest('Malformed request.')
+
     floating_ip = util.get_floating_ip_by_id(userid,
+                                             request.user_projects,
                                              floating_ip_id,
                                              for_update=True)
     action = req.keys()[0]
@@ -94,52 +174,29 @@ def floating_ip_action_demux(request, floating_ip_id):
     return f(request, floating_ip, action_args)
 
 
-def ip_to_dict(floating_ip):
-    machine_id = None
-    port_id = None
-    if floating_ip.nic is not None:
-        machine_id = floating_ip.nic.machine_id
-        port_id = floating_ip.nic.id
-    return {"fixed_ip_address": None,
-            "id": str(floating_ip.id),
-            "instance_id": str(machine_id) if machine_id else None,
-            "floating_ip_address": floating_ip.address,
-            "port_id": str(port_id) if port_id else None,
-            "floating_network_id": str(floating_ip.network_id),
-            "user_id": floating_ip.userid,
-            "tenant_id": floating_ip.project,
-            "deleted": floating_ip.deleted}
-
-
 @api.api_method(http_method="GET", user_required=True, logger=log,
                 serializations=["json"])
-def list_floating_ips(request):
+def list_floating_ips(request, view=_floatingip_list_view):
     """Return user reserved floating IPs"""
-    log.debug("list_floating_ips")
-
-    userid = request.user_uniq
-    floating_ips = IPAddress.objects.filter(userid=userid, deleted=False,
-                                            floating_ip=True).order_by("id")\
+    floating_ips = IPAddress.objects.for_user(userid=request.user_uniq,
+                                              projects=request.user_projects)\
+                                    .filter(floating_ip=True)\
+                                    .order_by("id")\
                                     .select_related("nic")
+
     floating_ips = utils.filter_modified_since(request, objects=floating_ips)
 
-    floating_ips = map(ip_to_dict, floating_ips)
-
-    request.serialization = "json"
-    data = json.dumps({"floatingips": floating_ips})
-
-    return HttpResponse(data, status=200)
+    return HttpResponse(view(floating_ips), status=200)
 
 
 @api.api_method(http_method="GET", user_required=True, logger=log,
                 serializations=["json"])
-def get_floating_ip(request, floating_ip_id):
+def get_floating_ip(request, floating_ip_id, view=_floatingip_details_view):
     """Return information for a floating IP."""
-    userid = request.user_uniq
-    floating_ip = util.get_floating_ip_by_id(userid, floating_ip_id)
-    request.serialization = "json"
-    data = json.dumps({"floatingip": ip_to_dict(floating_ip)})
-    return HttpResponse(data, status=200)
+    floating_ip = util.get_floating_ip_by_id(request.user_uniq,
+                                             request.user_projects,
+                                             floating_ip_id)
+    return HttpResponse(view(floating_ip), status=200)
 
 
 @api.api_method(http_method='POST', user_required=True, logger=log,
@@ -148,39 +205,66 @@ def get_floating_ip(request, floating_ip_id):
 def allocate_floating_ip(request):
     """Allocate a floating IP."""
     req = utils.get_json_body(request)
+
+    log.debug("User: %s, Action: create_floating_ip, Request: %s",
+              request.user_uniq, req)
+
     floating_ip_dict = api.utils.get_attribute(req, "floatingip",
                                                required=True, attr_type=dict)
     userid = request.user_uniq
     project = floating_ip_dict.get("project", None)
-    log.info('allocate_floating_ip user: %s request: %s', userid, req)
+    shared_to_project = floating_ip_dict.get("shared_to_project", False)
 
     # the network_pool is a mandatory field
     network_id = api.utils.get_attribute(floating_ip_dict,
                                          "floating_network_id",
                                          required=False,
                                          attr_type=(basestring, int))
+
     if network_id is None:
-        floating_ip = ips.create_floating_ip(userid, project=project)
+        floating_ip = \
+            ips.create_floating_ip(userid, project=project,
+                                   shared_to_project=shared_to_project)
     else:
         try:
             network_id = int(network_id)
         except ValueError:
             raise faults.BadRequest("Invalid networkd ID.")
 
-        network = util.get_network(network_id, userid, for_update=True,
-                                   non_deleted=True)
+        network = util.get_network(network_id, userid, request.user_projects,
+                                   for_update=True, non_deleted=True)
         address = api.utils.get_attribute(floating_ip_dict,
                                           "floating_ip_address",
                                           required=False,
                                           attr_type=basestring)
-        floating_ip = ips.create_floating_ip(userid, network, address,
-                                             project=project)
+        floating_ip = \
+            ips.create_floating_ip(userid, network, address,
+                                   project=project,
+                                   shared_to_project=shared_to_project)
 
-    log.info("User '%s' allocated floating IP '%s'", userid, floating_ip)
-    request.serialization = "json"
-    data = json.dumps({"floatingip": ip_to_dict(floating_ip)})
-    return HttpResponse(data, status=200)
+    log.info("User %s created floating IP %s, network %s, address %s",
+             userid, floating_ip.id, floating_ip.network_id,
+             floating_ip.address)
 
+    return HttpResponse(_floatingip_details_view(floating_ip), status=200)
+
+@api.api_method(http_method='POST', user_required=True, logger=log,
+                serializations=["json"])
+@transaction.commit_on_success
+def compute_allocate_floating_ip(request):
+    """Allocate a floating IP."""
+    log.debug("User: %s, Action: compute_create_floating_ip, Request: %s",
+              request.user_uniq, request)
+
+    userid = request.user_uniq
+    floating_ip = ips.create_floating_ip(userid)
+
+    log.info("User %s created floating IP %s, network %s, address %s",
+             userid, floating_ip.id, floating_ip.network_id,
+             floating_ip.address)
+
+    return HttpResponse(
+        _compute_floatingip_details_view(floating_ip), status=200)
 
 @api.api_method(http_method='DELETE', user_required=True, logger=log,
                 serializations=["json"])
@@ -188,12 +272,17 @@ def allocate_floating_ip(request):
 def release_floating_ip(request, floating_ip_id):
     """Release a floating IP."""
     userid = request.user_uniq
-    log.info("release_floating_ip '%s'. User '%s'.", floating_ip_id, userid)
 
-    floating_ip = util.get_floating_ip_by_id(userid, floating_ip_id,
-                                             for_update=True)
+    log.debug("User: %s, Floating IP: %s, Action: delete",
+              request.user_uniq, floating_ip_id)
+
+    floating_ip = util.get_floating_ip_by_id(userid, request.user_projects,
+                                             floating_ip_id, for_update=True)
+
     ips.delete_floating_ip(floating_ip)
-    log.info("User '%s' released IP '%s", userid, floating_ip)
+
+    log.info("User %s deleted floating IP %s", request.user_uniq,
+             floating_ip.id)
 
     return HttpResponse(status=204)
 
@@ -201,7 +290,7 @@ def release_floating_ip(request, floating_ip_id):
 @api.api_method(http_method='PUT', user_required=True, logger=log,
                 serializations=["json"])
 @transaction.commit_on_success
-def update_floating_ip(request, floating_ip_id):
+def update_floating_ip(request, floating_ip_id, view=_floatingip_details_view):
     """Update a floating IP."""
     raise faults.NotImplemented("Updating a floating IP is not supported.")
     #userid = request.user_uniq
@@ -244,12 +333,25 @@ def list_floating_ip_pools(request):
     return HttpResponse(data, status=200)
 
 
-@transaction.commit_on_success
 def reassign(request, floating_ip, args):
+    if request.user_uniq != floating_ip.userid:
+        raise faults.Forbidden("Action 'reassign' is allowed only to the owner"
+                               " of the floating IP.")
+
+    shared_to_project = args.get("shared_to_project", False)
+    if shared_to_project and not settings.CYCLADES_SHARED_RESOURCES_ENABLED:
+        raise faults.Forbidden("Sharing resource to the members of the project"
+                                " is not permitted")
+
     project = args.get("project")
     if project is None:
         raise faults.BadRequest("Missing 'project' attribute.")
-    ips.reassign_floating_ip(floating_ip, project)
+
+    ips.reassign_floating_ip(floating_ip, project, shared_to_project)
+
+    log.info("User %s reaasigned floating IP %s to project %s, shared: %s",
+             request.user_uniq, floating_ip.id, project, shared_to_project)
+
     return HttpResponse(status=200)
 
 

@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2016 GRNET S.A.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -26,9 +26,9 @@ from django.db.models import Q
 from django.http import HttpResponse, HttpResponseRedirect, Http404
 from django.shortcuts import redirect
 from django.utils.translation import ugettext as _
-from django.core.exceptions import PermissionDenied
+from django.core.exceptions import PermissionDenied, ValidationError
 from django.views.decorators.http import require_http_methods
-from django.utils import simplejson as json
+import json
 from django.template import RequestContext
 
 from synnefo_branding import utils as branding
@@ -46,7 +46,7 @@ from astakos.im.forms import LoginForm, InvitationForm, FeedbackForm, \
 from astakos.im.forms import ExtendedProfileForm as ProfileForm
 from synnefo.lib.services import get_public_endpoint
 from astakos.im.user_utils import send_feedback, logout as auth_logout, \
-    invite as invite_func
+    invite as invite_func, change_user_email
 from astakos.im import settings
 from astakos.im import presentation
 from astakos.im import auth_providers as auth
@@ -585,9 +585,7 @@ def logout(request, template='registration/logged_out.html',
         email = request.user.email
         auth_logout(request)
     else:
-        response['Location'] = reverse('index')
-        response.status_code = 301
-        return response
+        return HttpResponseRedirect(reverse('index'))
 
     next = restrict_next(
         request.GET.get('next'),
@@ -595,11 +593,9 @@ def logout(request, template='registration/logged_out.html',
     )
 
     if next:
-        response['Location'] = next
-        response.status_code = 302
+        return HttpResponseRedirect(next)
     elif settings.LOGOUT_NEXT:
-        response['Location'] = settings.LOGOUT_NEXT
-        response.status_code = 301
+        return HttpResponseRedirect(settings.LOGOUT_NEXT)
     else:
         last_provider = request.COOKIES.get(
             'astakos_last_login_method', 'local')
@@ -614,9 +610,7 @@ def logout(request, template='registration/logged_out.html',
         if extra:
             message += "<br />" + extra
         messages.success(request, message)
-        response['Location'] = reverse('index')
-        response.status_code = 301
-    return response
+        return HttpResponseRedirect(reverse('index'))
 
 
 @require_http_methods(["GET", "POST"])
@@ -732,50 +726,15 @@ def approval_terms(request, term_id=None,
 @require_http_methods(["GET", "POST"])
 @cookie_fix
 @transaction.commit_on_success
-def change_email(request, activation_key=None,
-                 email_template_name='registration/email_change_email.txt',
+def request_change_email(request,
+                 email_to_new_template_name='registration/email_change_email_new_email.txt',
                  form_template_name='registration/email_change_form.html',
-                 confirm_template_name='registration/email_change_done.html',
                  extra_context=None):
+
     extra_context = extra_context or {}
 
     if not settings.EMAILCHANGE_ENABLED:
         raise PermissionDenied
-
-    if activation_key:
-        try:
-            try:
-                email_change = EmailChange.objects.get(
-                    activation_key=activation_key)
-            except EmailChange.DoesNotExist:
-                logger.error("[change-email] Invalid or used activation "
-                             "code, %s", activation_key)
-                raise Http404
-
-            if (
-                request.user.is_authenticated() and
-                request.user == email_change.user or not
-                request.user.is_authenticated()
-            ):
-                user = EmailChange.objects.change_email(activation_key)
-                msg = _(astakos_messages.EMAIL_CHANGED)
-                messages.success(request, msg)
-                transaction.commit()
-                return HttpResponseRedirect(reverse('edit_profile'))
-            else:
-                logger.error("[change-email] Access from invalid user, %s %s",
-                             email_change.user, request.user.log_display)
-                raise PermissionDenied
-        except ValueError, e:
-            messages.error(request, e)
-            transaction.rollback()
-            return HttpResponseRedirect(reverse('index'))
-
-        return render_response(confirm_template_name,
-                               modified_user=user if 'user' in locals()
-                               else None,
-                               context_instance=get_context(request,
-                                                            extra_context))
 
     if not request.user.is_authenticated():
         path = quote(request.get_full_path())
@@ -787,16 +746,23 @@ def change_email(request, activation_key=None,
         change = request.user.emailchanges.get()
         if change.activation_key_expired():
             change.delete()
-            transaction.commit()
             return HttpResponseRedirect(reverse('email_change'))
 
     form = EmailChangeForm(request.POST or None)
     if request.method == 'POST' and form.is_valid():
-        ec = form.save(request, email_template_name, request)
-        msg = _(astakos_messages.EMAIL_CHANGE_REGISTERED)
-        messages.success(request, msg)
-        transaction.commit()
-        return HttpResponseRedirect(reverse('edit_profile'))
+        new_email = request.POST['new_email_address']
+        try:
+            change_user_email(
+                user=request.user,
+                new_email=new_email,
+                email_to_new_template_name=email_to_new_template_name,
+            )
+            msg = _(astakos_messages.EMAIL_CHANGE_REGISTERED)
+            messages.success(request, msg)
+            return HttpResponseRedirect(reverse('edit_profile'))
+        except ValidationError:
+            pass
+
 
     if request.user.email_change_is_pending():
         messages.warning(request,
@@ -807,6 +773,51 @@ def change_email(request, activation_key=None,
         form=form,
         context_instance=get_context(request, extra_context)
     )
+
+
+@require_http_methods(["GET"])
+@cookie_fix
+@transaction.commit_on_success
+def change_email(request, activation_key=None,
+                 confirm_template_name='registration/email_change_done.html',
+                 extra_context=None):
+    extra_context = extra_context or {}
+
+    if not activation_key:
+        return HttpResponseNotFound()
+
+    try:
+        try:
+            email_change = EmailChange.objects.get(
+                activation_key=activation_key)
+        except EmailChange.DoesNotExist:
+            logger.error("[change-email] Invalid or used activation "
+                         "code, %s", activation_key)
+            raise Http404
+
+        if (
+            request.user.is_authenticated() and
+            request.user == email_change.user or not
+            request.user.is_authenticated()
+        ):
+            user = EmailChange.objects.change_email(activation_key)
+            msg = _(astakos_messages.EMAIL_CHANGED)
+            messages.success(request, msg)
+            return HttpResponseRedirect(reverse('edit_profile'))
+        else:
+            logger.error("[change-email] Access from invalid user, %s %s",
+                         email_change.user, request.user.log_display)
+            raise PermissionDenied
+    except ValueError, e:
+        messages.error(request, e)
+        transaction.rollback()
+        return HttpResponseRedirect(reverse('index'))
+
+    return render_response(confirm_template_name,
+                           modified_user=user if 'user' in locals()
+                           else None,
+                           context_instance=get_context(request,
+                                                        extra_context))
 
 
 @cookie_fix
@@ -986,7 +997,7 @@ def get_menu(request, with_extra_links=False, with_signout=True):
         mimetype = 'application/javascript'
         data = '%s(%s)' % (callback, data)
 
-    return HttpResponse(content=data, mimetype=mimetype)
+    return HttpResponse(content=data, content_type=mimetype)
 
 
 class MenuItem(dict):
@@ -1042,4 +1053,4 @@ def get_services(request):
         mimetype = 'application/javascript'
         data = '%s(%s)' % (callback, data)
 
-    return HttpResponse(content=data, mimetype=mimetype)
+    return HttpResponse(content=data, content_type=mimetype)

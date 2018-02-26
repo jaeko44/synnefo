@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #coding=utf8
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2016 GRNET S.A.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -19,6 +19,7 @@ from urlparse import urlunsplit, urlsplit, urlparse
 from xml.dom import minidom
 from urllib import quote, unquote
 from mock import patch, PropertyMock
+from django_nose import NoseTestSuiteRunner
 
 from snf_django.utils.testing import with_settings, astakos_user
 
@@ -31,13 +32,12 @@ from synnefo.lib import join_urls
 
 from django.test import TestCase
 from django.test.client import Client, MULTIPART_CONTENT, FakePayload
-from django.test.simple import DjangoTestSuiteRunner
 from django.conf import settings
 from django.utils.http import urlencode
 from django.utils.encoding import smart_unicode
 from django.db.backends.creation import TEST_DATABASE_PREFIX
 
-import django.utils.simplejson as json
+import json
 
 
 import sys
@@ -93,7 +93,10 @@ def prepare_db_connection():
     """Build pithos backend connection string from django default database"""
 
     db = settings.DATABASES['default']
-    name = db.get('TEST_NAME', TEST_DATABASE_PREFIX + db['NAME'])
+    try:
+        name = db['TEST']['NAME']
+    except KeyError:
+        name = TEST_DATABASE_PREFIX + db['NAME']
 
     if (pithos_settings.BACKEND_DB_MODULE == 'pithos.backends.lib.sqlalchemy'):
         if db['ENGINE'] == 'django.db.backends.sqlite3':
@@ -124,7 +127,7 @@ def filter_headers(headers, prefix):
     return meta
 
 
-class PithosTestSuiteRunner(DjangoTestSuiteRunner):
+class PithosTestSuiteRunner(NoseTestSuiteRunner):
     def setup_test_environment(self, **kwargs):
         pithos_settings.BACKEND_MAPFILE_PREFIX = \
             'snf_test_pithos_app_%s_' % time.time()
@@ -147,12 +150,38 @@ class PithosTestSuiteRunner(DjangoTestSuiteRunner):
 
 
 class PithosTestClient(Client):
-    def _get_path(self, parsed):
-        # If there are parameters, add them
-        if parsed[3]:
-            return unquote(parsed[2] + ";" + parsed[3])
-        else:
-            return unquote(parsed[2])
+    def generic(self, method, path, data='',
+                content_type='application/octet-stream', secure=False,
+                **extra):
+        """Constructs an arbitrary HTTP request."""
+        from django.utils.encoding import force_bytes
+        import six
+        parsed = urlparse(path)
+        data = force_bytes(data, settings.DEFAULT_CHARSET)
+        r = {
+            'PATH_INFO': self._get_path(parsed),
+            'REQUEST_METHOD': str(method),
+            'SERVER_PORT': str('443') if secure else str('80'),
+            'wsgi.url_scheme': str('https') if secure else str('http'),
+        }
+        # Original django function used the check 'if data:'. But this is not
+        # enough as it does not take into account zero-length payloads
+        if data is not None:
+            r.update({
+                'CONTENT_LENGTH': len(data),
+                'CONTENT_TYPE': str(content_type),
+                'wsgi.input': FakePayload(data),
+            })
+        r.update(extra)
+        # If QUERY_STRING is absent or empty, we want to extract it from the URL.
+        if not r.get('QUERY_STRING'):
+            query_string = force_bytes(parsed[4])
+            # WSGI requires latin-1 encoded strings. See get_path_info().
+            if six.PY3:
+                query_string = query_string.decode('iso-8859-1')
+            r['QUERY_STRING'] = query_string
+        return self.request(**r)
+
 
     def copy(self, path, data={}, content_type=MULTIPART_CONTENT,
              follow=False, **extra):

@@ -160,14 +160,32 @@
 
             this.password = this.$("#new-machine-password");
             this.copy = this.$(".clipboard");
+            this.confirm = this.$(".confirm");
+            this.show_machine = this.$(".show-machine");
 
-            this.$(".show-machine").click(_.bind(function(){
+            this.show_machine.click(_.bind(function(){
                 if (this.$(".show-machine").hasClass("in-progress")) {
                     return;
                 }
-                this.hide();
+                this.show_machine.hide();
+                if (this.supports_password) {
+                  this.confirm.show();
+                } else {
+                  this.hide();
+                }
             }, this));
             
+            this.confirm.find("button.no").click(_.bind(function() {
+                this.prevent_close = false;
+                this.hide();
+            }, this));
+
+            this.confirm.find("button.yes").click(_.bind(function() {
+                storage.vms.delete_admin_password(this.vm_id);
+                this.prevent_close = false;
+                this.hide();
+            }, this));
+
             var self = this;
             _.bindAll(this, "handle_vm_added");
             storage.vms.bind("add", this.handle_vm_added);
@@ -204,21 +222,27 @@
         },
 
         show: function(pass, vm_id, image) {
+            this.confirm.hide();
+            this.show_machine.show();
             this.pass = pass;
             this.vm_id = vm_id;
             this.image = image;
             var self = this;
+
             this.password.unbind("click").click(function() {
                 self.password.selectRange(0);
             });
 
             views.VMCreationPasswordView.__super__.show.apply(this, arguments);
             if (this.image.supports("password")) {
+                this.supports_password = true;
+                this.prevent_close = true;
                 this.$(".password-cont").show();
                 this.$(".subinfo.description").show();
                 this.$(".disabled.password-cont").hide();
                 this.$(".disabled.subinfo.description").hide();
             } else {
+                this.supports_password = false;
                 this.$(".password-cont").hide();
                 this.$(".subinfo.description").hide();
                 this.$(".disabled.password-cont").show();
@@ -899,7 +923,7 @@
         
         update_flavors_data: function() {
             if (!this.parent.project) { return }
-            this.flavors = this.get_active_flavors();
+            this.flavors = this.get_active_flavors(this.parent.project);
             this.flavors_data = storage.flavors.get_data(this.flavors);
             
             var self = this;
@@ -931,7 +955,8 @@
             }
             
             var quotas = this.get_project().quotas.get_available_for_vm({active: true});
-            var user_excluded = storage.flavors.unavailable_values_for_quotas(quotas);
+            var active_flavors = storage.flavors.active(this.get_project());
+            var user_excluded = storage.flavors.unavailable_values_for_quotas(quotas, active_flavors);
 
             unavailable.disk = user_excluded.disk.concat(image_excluded.disk);
             unavailable.ram = user_excluded.ram.concat(image_excluded.ram);
@@ -960,8 +985,9 @@
             
         set_valid_current_for: function(t, val) {
             var found = this.flavors[0];
+            var self = this;
             _.each(this.flavors, function(flv) {
-                if (flv.get(t) == val) {
+                if (flv.get(t) == val && self.flavor_is_valid(flv)) {
                     found = flv;
                 }
             });
@@ -1028,19 +1054,13 @@
         },
 
         create_flavors: function() {
-            var flavors = this.get_active_flavors();
+            if(!this.parent.project) { return; }
+            var flavors = this.get_active_flavors(this.parent.project);
             var valid_flavors = this.get_valid_flavors();
-            this.__added_flavors = {'cpu':[], 'ram':[], 'disk':[], 'disk_template':[] };
+            this.flavor_data = storage.flavors.get_data(flavors);
 
-            _.each(flavors, _.bind(function(flv){
-                this.add_flavor(flv);
-            }, this));
+            this.prepare_flavor_view(this.flavor_data);
             
-            this.sort_flavors(this.disks);
-            this.sort_flavors(this.cpus);
-            this.sort_flavors(this.mems);
-            this.sort_flavors(this.disk_templates);
-
             var self = this;
             this.$(".flavor-options li.option").click(function(){
                 var el = $(this);
@@ -1065,19 +1085,6 @@
               }
             });
         },
-
-        sort_flavors: function(els) {
-            var prev = undefined;
-            els.find("li").each(function(i,el){
-                el = $(el);
-                if (!prev) { prev = el; return true };
-                if (el.data("value") < prev.data("value")) {
-                    prev.before(el);
-                }
-                prev = el;
-            })
-        },
-        
         ui_selected: function() {
             var args = [this.$(".option.cpu.selected").data("value"), 
                 this.$(".option.mem.selected").data("value"), 
@@ -1109,65 +1116,66 @@
             this.$(".disk-template-description p").html(flv.get_disk_template_info().description || "");
         },
         
-        __added_flavors: {'cpu':[], 'ram':[], 'disk':[], 'disk_template':[]},
-        add_flavor: function(flv) {
-            var values = {'cpu': flv.get('cpu'), 
-                          'mem': flv.get('ram'), 
-                          'disk': flv.get('disk'), 
-                          'disk_template': flv.get('disk_template')};
+        flavor_data: {'cpu':[], 'ram':[], 'disk':[], 'disk_template':[]},
+        prepare_flavor_view: function(flavor_data) {
+            var flavor_data = flavor_data || this.flavor_data;
 
             disabled = "";
             
-            if (this.__added_flavors.cpu.indexOf(values.cpu) == -1) {
-                var cpu = $(('<li class="option cpu value-{0} {1}">' + 
-                             '<span class="value">{0}</span>' + 
-                             '<span class="metric">x</span></li>').format(
-                            _.escape(values.cpu), disabled)).data('value', values.cpu);
-                this.cpus.append(cpu);
-                this.__added_flavors.cpu.push(values.cpu);
-            }
-
-            if (this.__added_flavors.ram.indexOf(values.mem) == -1) {
-                var mem_value = parseInt(_.escape(values.mem))*1024*1024;
-                var displayvalue = synnefo.util.readablizeBytes(mem_value, 
-                                                               0).split(" ");
-                var mem = $(('<li class="option mem value-{2}">' + 
-                             '<span class="value">{0}</span>' + 
-                             '<span class="metric">{1}</span></li>').format(
-                          displayvalue[0], displayvalue[1], values.mem)).data(
-                          'value', values.mem);
-                this.mems.append(mem);
-                this.__added_flavors.ram.push(values.mem);
-            }
-
-            if (this.__added_flavors.disk.indexOf(values.disk) == -1) {
-                var disk = $(('<li class="option disk value-{0}">' + 
+            var self = this;
+            _.each(flavor_data.cpu, function(cpu) {
+                var $cpu = $(('<li class="option cpu value-{0} {1}">' + 
                               '<span class="value">{0}</span>' + 
-                              '<span class="metric">GB</span></li>').format(
-                            _.escape(values.disk))).data('value', values.disk);
-                this.disks.append(disk);
-                this.__added_flavors.disk.push(values.disk)
-            }
-            
-            if (this.__added_flavors.disk_template.indexOf(values.disk_template) == -1) {
-                var template_info = flv.get_disk_template_info();
-                var disk_template = $(('<li title="{2}" class="option disk_template value-{0}">' + 
-                                       '<span class="value name">{1}</span>' +
-                                       '</li>').format(values.disk_template, 
-                                            _.escape(template_info.name), 
-                                            template_info.description)).data('value', 
-                                                                values.disk_template);
-
-                this.disk_templates.append(disk_template);
-                this.__added_flavors.disk_template.push(values.disk_template)
-            }
-            
+                              '<span class="metric">x</span></li>').format(
+                             _.escape(cpu), disabled)).data('value', cpu);
+                self.cpus.append($cpu);
+            })
+            _.each(flavor_data.ram, function(ram) {
+                var ram_value = parseInt(_.escape(ram))*1024*1024;
+                var displayvalue = synnefo.util.readablizeBytes(ram_value, 
+                                                               0).split(" ");
+                var $ram = $(('<li class="option mem value-{2}">' + 
+                              '<span class="value">{0}</span>' + 
+                              '<span class="metric">{1}</span></li>').format(
+                           displayvalue[0], displayvalue[1], ram)).data(
+                           'value', ram);
+                self.mems.append($ram);
+            })
+            _.each(flavor_data.disk, function(disk) {
+                var $disk = $(('<li class="option disk value-{0}">' + 
+                               '<span class="value">{0}</span>' + 
+                               '<span class="metric">GB</span></li>').format(
+                               _.escape(disk))).data('value', disk);
+                self.disks.append($disk);
+            })
+            _.each(flavor_data.disk_template, function(disk_template) {
+                var template_info = snf.config.flavors_disk_templates_info[disk_template];
+                if (!template_info) { 
+                    template_info = { name: disk_template, description: '' }
+                }
+                var $disk_template = $(('<li title="{2}" class="option disk_template value-{0}">' + 
+                                        '<span class="value name">{1}</span>' +
+                                        '</li>').format(disk_template, 
+                                        _.escape(template_info.name), 
+                                        template_info.description)).data('value', 
+                                                                         disk_template);
+                self.disk_templates.append($disk_template);
+            })
         },
         
-        get_active_flavors: function() {
-            return storage.flavors.active().filter(function(flv) {
-	        return flv.get("SNF:allow_create")
-	    });
+        get_active_flavors: function(project) {
+            var project = project || this.parent.project;
+            var user_overrides = synnefo.config.user_override_allow_create;
+            return storage.flavors.active(project).filter(function(flv) {
+
+              var allow_create = flv.get("SNF:allow_create");
+              allow_create |= _.filter(user_overrides, function(reg) {
+                var _flv = flv;
+                return reg.exec(flv.get('name'));
+              }).length > 0;
+
+              return (allow_create)
+            });
         },
 
         get_valid_flavors: function() {

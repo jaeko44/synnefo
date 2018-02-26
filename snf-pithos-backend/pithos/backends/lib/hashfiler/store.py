@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2016 GRNET S.A. and individual contributors
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -19,8 +19,8 @@ from mapper import Mapper
 
 class Store(object):
     """Store.
-       Required constructor parameters: path, block_size, hash_algorithm,
-       blockpool, mappool.
+       Required constructor parameters: block_size, hash_algorithm,
+                                        archipelago_cfile, namelen
     """
 
     def __init__(self, **params):
@@ -30,7 +30,6 @@ class Store(object):
               }
         self.blocker = Blocker(**pb)
         pm = {'namelen': self.blocker.hashlen,
-              'hashtype': params['hash_algorithm'],
               'archipelago_cfile': params['archipelago_cfile'],
               }
         self.mapper = Mapper(**pm)
@@ -43,9 +42,6 @@ class Store(object):
 
     def map_delete(self, name):
         pass
-
-    def map_copy(self, dst, src, size):
-        self.mapper.map_copy(dst, src, size)
 
     def block_get(self, hash):
         blocks = self.blocker.block_retr((hash,))

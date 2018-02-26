@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 #
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2016 GRNET S.A.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -43,7 +43,7 @@ from django.conf import settings
 import logging
 import itertools
 import bitarray
-import simplejson as json
+import json
 from datetime import datetime, timedelta
 
 from synnefo.db import transaction
@@ -248,12 +248,13 @@ class BackendReconciler(object):
         db_flavor = db_server.flavor
         gnt_flavor = gnt_server["flavor"]
         if (db_flavor.ram != gnt_flavor["ram"] or
-           db_flavor.cpu != gnt_flavor["vcpus"]):
+           db_flavor.cpu != gnt_flavor["vcpus"] or
+           db_flavor.disk != gnt_flavor["disk"]):
             try:
                 gnt_flavor = Flavor.objects.get(
                     ram=gnt_flavor["ram"],
                     cpu=gnt_flavor["vcpus"],
-                    disk=db_flavor.disk,
+                    disk=gnt_flavor["disk"],
                     volume_type_id=db_flavor.volume_type_id)
             except Flavor.DoesNotExist:
                 self.log.warning("Server '%s' has unknown flavor.", server_id)
@@ -519,14 +520,26 @@ def parse_gnt_instance(instance):
     ram = beparams["maxmem"]
     state = instance["oper_state"] and "STARTED" or "STOPPED"
 
+    disks = disks_from_instance(instance)
+    root_disk = [d for d in disks if d['index'] == 0]
+    if root_disk:
+        disk = (int(root_disk[0].get('size', 0)) >> 10)
+    else:
+        disk = 0
+
+    flavor = {
+        'vcpus': vcpus,
+        'ram': ram,
+        'disk': disk
+    }
+
     return {
         "id": instance_id,
         "state": state,  # FIX
         "updated": datetime.fromtimestamp(instance["mtime"]),
-        "disks": disks_from_instance(instance),
+        "disks": disks,
         "nics": nics_from_instance(instance),
-        "flavor": {"vcpus": vcpus,
-                   "ram": ram},
+        "flavor": flavor,
         "tags": instance["tags"]
     }
 

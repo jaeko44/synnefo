@@ -1,4 +1,4 @@
-// Copyright (C) 2010-2014 GRNET S.A.
+// Copyright (C) 2010-2017 GRNET S.A.
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -12,7 +12,6 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
-// 
 
 ;(function(root){
 
@@ -140,6 +139,7 @@
         el: '#multiple_actions_container',
         
         initialize: function() {
+
             this.actions = {};
             this.ns_config = {};
 
@@ -545,7 +545,7 @@
             
             if (this.parent.current_view && this.parent.current_view.vms_view) {
 
-                if (storage.vms.length > 0) {
+                if (storage.vms.no_ghost_vms().length > 0) {
                     this.machine_view_selector.show();
                     var machine_index = this.parent.views_ids[this.parent.current_view_id];
                     $(this.machine_view_selector.find("a").get(machine_index)).addClass("activelink");
@@ -913,35 +913,35 @@
             this.update_status("flavors", 0);
             storage.flavors.fetch({refresh:true, update:false, success:function(){
                 self.update_status("flavors", 1);
+                self.update_status("resources", 0);
                 self.check_status()
-            }});
-
-            this.update_status("resources", 0);
-            storage.resources.fetch({refresh:true, update:false, success: function(){
-                self.update_status("resources", 1);
-                self.update_status("projects", 0);
-                self.check_status();
-                storage.projects.fetch({refresh:true, update:true, success: function() {
-                  self.update_status("projects", 1);
-                  self.update_status("quotas", 0);
-                  self.check_status();
-                  storage.quotas.fetch({refresh:true, update:true, success: function() {
-                    self.update_status("quotas", 1);
+                storage.resources.fetch({refresh:true, update:false, success: function(){
+                    self.update_status("resources", 1);
+                    self.update_status("projects", 0);
                     self.check_status();
-                    self.update_status("volumes", 0);
-                    storage.volumes.fetch({refresh:true, update:false, success: function(){
-                          self.update_status("volumes", 1);
-                          self.check_status();
-                    }});  
-
-                    // sync load initial data
-                    self.update_status("images", 0);
-                    storage.images.fetch({refresh:true, update:false, success: function(){
-                        self.update_status("images", 1);
+                    storage.projects.fetch({refresh:true, update:true, success: function() {
+                      self.update_status("projects", 1);
+                      self.update_status("quotas", 0);
+                      self.check_status();
+                      storage.quotas.fetch({refresh:true, update:true, success: function() {
+                        self.update_status("quotas", 1);
                         self.check_status();
-                        self.load_nets_and_vms();
-                    }});
-                  }});
+                        self.update_status("volumes", 0);
+                        storage.volume_types.fetch({refresh: true, update: false, success: function() {
+                          storage.volumes.fetch({refresh:true, update:false, success: function(){
+                                self.update_status("volumes", 1);
+                                self.check_status();
+                          }});
+                        }});
+                        // sync load initial data
+                        self.update_status("images", 0);
+                        storage.images.fetch({refresh:true, update:false, success: function(){
+                            self.update_status("images", 1);
+                            self.check_status();
+                            self.load_nets_and_vms();
+                        }});
+                      }});
+                    }})
                 }})
             }})
         },
@@ -1017,7 +1017,11 @@
 
         check_empty: function() {
             if (!this.loaded) { return }
-            if (storage.vms.length == 0) {
+            if (storage.vms.no_ghost_vms().length == 0) {
+                if (!(this.current_view instanceof synnefo.views.VMListView)) { 
+                  this.show_empty();
+                  return;
+                }
                 this.show_view("machines");
                 this.router.show_welcome();
                 this.empty_hidden = false;
@@ -1250,7 +1254,46 @@
                 snf.ui.trigger_error("CRITICAL", msg, {}, { file:file + ":" + line, allow_close: true });
             };
         }
-        snf.ui.main.load();
+
+        if (synnefo.config.snapshots_groups.length || _.keys(synnefo.config.flavor_override_allow_create).length) {
+          var token_data = {
+            'auth': {
+              'token': {
+                'id': synnefo.user.get_token()
+              }
+            }
+          };
+
+          var override_policy = synnefo.config.flavor_override_allow_create;
+          var allow_create_groups = _.keys(override_policy);
+          bb.sync('create', undefined, {
+            url: synnefo.config.auth_url + '/tokens',
+            data: JSON.stringify(token_data),
+            contentType: 'application/json',
+            success: function(data) {
+              if (data.access) {
+                _.each(data.access.user.roles, function(g) {
+                  var group = g.name;
+                  if (synnefo.config.snapshots_groups.indexOf(group) > -1) {
+                    synnefo.config.snapshots_enabled = true;
+                  }
+                  if (allow_create_groups.length && allow_create_groups.indexOf(group) > -1) {
+                    _.each(override_policy[group], function(flv) {
+                      try {
+                        synnefo.config.user_override_allow_create.push(new RegExp(flv));
+                      } catch(err) { console.error(err); }
+                    });
+                  }
+                });
+              }
+            },
+            error: function() { console.error(arguments) },
+            complete: function() { snf.ui.main.load(); }
+          });
+        } else {
+          snf.ui.main.load();
+        }
+
     }
 
 })(this);

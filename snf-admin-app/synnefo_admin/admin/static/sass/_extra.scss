@@ -319,7 +319,11 @@ body .shortcuts {
 	}
 	dd {
 		margin-left: 60px;
-	}
+		p {
+			line-height: 2rem;
+			margin-bottom: 6px;
+		}
+    }
 }
 
 .popover {
@@ -432,4 +436,12 @@ body .shortcuts {
 }
 .popover-content {
 	max-width: 800px;
+}
+
+.capitalize {
+    text-transform: capitalize;
+}
+
+.nowrap {
+    white-space: nowrap;
 }

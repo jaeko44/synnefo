@@ -23,8 +23,9 @@ DEFAULT_EXCEPTION_REPORTER_FILTER = "synnefo.webproject.exception_filter.Synnefo
 HIDDEN_SETTINGS = 'SECRET|PASSWORD|PROFANITIES_LIST|SIGNATURE|AMQP_HOSTS|'\
                   'PRIVATE_KEY|DB_CONNECTION|TOKEN'
 HIDDEN_COOKIES = ['password', '_pithos2_a', 'token', 'sessionid', 'shibstate',
-                  'shibsession', 'CSRF_COOKIE']
-HIDDEN_HEADERS = ['HTTP_X_AUTH_TOKEN', 'HTTP_COOKIE']
+                  'shibsession', 'CSRF_COOKIE', 'csrftoken']
+HIDDEN_HEADERS = ['HTTP_X_AUTH_TOKEN', 'HTTP_COOKIE', 'X-Auth-Token', 'Cookie']
+HIDDEN_STACKVARS = '__ALL__'
 # Mail size limit for unhandled exception
 MAIL_MAX_LEN = 100 * 1024  # (100KB)
 
@@ -34,3 +35,9 @@ MAIL_MAX_LEN = 100 * 1024  # (100KB)
 #in a POST request to be lost. Due to the REST nature of most of the registered
 #Synnefo endpoints we prefer to disable this behaviour by default.
 APPEND_SLASH = False
+
+# Serve requests for the hosts/domains specified. A value of '*' matches anything.
+ALLOWED_HOSTS = ['*']
+
+# Silence invalid django warnings
+SILENCED_SYSTEM_CHECKS = ["1_6.W002"]

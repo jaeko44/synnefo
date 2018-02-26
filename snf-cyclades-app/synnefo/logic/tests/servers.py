@@ -1,5 +1,5 @@
 # vim: set fileencoding=utf-8 :
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2017 GRNET S.A. and individual contributors
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -16,9 +16,9 @@
 
 # Provides automated tests for logic module
 from django.test import TransactionTestCase
-#from snf_django.utils.testing import mocked_quotaholder
 from synnefo.logic import servers
 from synnefo.logic import backend
+from synnefo.logic.backend import GNT_EXTP_VOLTYPESPEC_PREFIX
 from synnefo import quotas
 from synnefo.db import models_factory as mfactory, models
 from mock import patch, Mock
@@ -45,6 +45,7 @@ fixed_image.return_value = {'location': 'pithos://foo',
 @patch('synnefo.api.util.get_image', fixed_image)
 @patch("synnefo.logic.rapi_pool.GanetiRapiClient")
 class ServerCreationTest(TransactionTestCase):
+
     def test_create(self, mrapi):
         flavor = mfactory.FlavorFactory()
         kwargs = {
@@ -84,8 +85,24 @@ class ServerCreationTest(TransactionTestCase):
 
         # test ext settings:
         req = deepcopy(kwargs)
+        vlmt = mfactory.VolumeTypeFactory(disk_template='ext_archipelago')
+        # Generate 4 specs. 2 prefixed with GNT_EXTP_VOLTYPESPEC_PREFIX
+        # and 2 with an other prefix that should be omitted
+        volume_type_specs = [
+            mfactory.VolumeTypeSpecsFactory(
+                volume_type=vlmt, key='%sbar' % GNT_EXTP_VOLTYPESPEC_PREFIX),
+            mfactory.VolumeTypeSpecsFactory(
+                volume_type=vlmt, key='%sfoo' % GNT_EXTP_VOLTYPESPEC_PREFIX),
+            mfactory.VolumeTypeSpecsFactory(
+                volume_type=vlmt, key='other-prefx-baz'),
+            mfactory.VolumeTypeSpecsFactory(
+                volume_type=vlmt, key='another-prefix-biz'),
+        ]
+
+        gnt_prefixed_specs = filter(lambda s: s.key.startswith(
+            GNT_EXTP_VOLTYPESPEC_PREFIX), volume_type_specs)
         ext_flavor = mfactory.FlavorFactory(
-            volume_type__disk_template="ext_archipelago",
+            volume_type=vlmt,
             disk=1)
         req["flavor"] = ext_flavor
         mrapi().CreateInstance.return_value = 42
@@ -101,20 +118,33 @@ class ServerCreationTest(TransactionTestCase):
         }
         with mocked_quotaholder():
             with override_settings(settings, **osettings):
-                vm = servers.create(**req)
+                with patch(
+                    'synnefo.logic.backend_allocator.update_backends_disk_templates'  # noqa E265
+                ) as update_disk_templates_mock:
+                    # Check that between the `get_available_backends` call
+                    # and the `update_backend_disk_templates` call
+                    # the backend doesn't change.
+                    update_disk_templates_mock.return_value = [backend]
+                    vm = servers.create(**req)
+
+        update_disk_templates_mock.assert_called_once_with([backend])
         name, args, kwargs = mrapi().CreateInstance.mock_calls[-1]
-        self.assertEqual(kwargs["disks"][0],
-                         {"provider": "archipelago",
-                          "origin": "test_mapfile",
-                          "origin_size": 1000,
-                          "name": vm.volumes.all()[0].backend_volume_uuid,
-                          "foo": "mpaz",
-                          "lala": "lolo",
-                          "size": 1024})
+        disk_kwargs = {"provider": "archipelago",
+                       "origin": "test_mapfile",
+                       "origin_size": 1000,
+                       "name": vm.volumes.all()[0].backend_volume_uuid,
+                       "foo": "mpaz",
+                       "lala": "lolo",
+                       "size": 1024}
+        disk_kwargs.update({spec.key[len(GNT_EXTP_VOLTYPESPEC_PREFIX):]:
+                            spec.value
+                            for spec in gnt_prefixed_specs})
+        self.assertEqual(kwargs["disks"][0], disk_kwargs)
 
 
 @patch("synnefo.logic.rapi_pool.GanetiRapiClient")
 class ServerTest(TransactionTestCase):
+
     def test_connect_network(self, mrapi):
         # Common connect
         for dhcp in [True, False]:
@@ -154,6 +184,59 @@ class ServerTest(TransactionTestCase):
         self.assertEqual(nics[2]["ip"], None)
         self.assertEqual(nics[2]["network"], net.backend_id)
 
+    def test_attach_volume_type_specs(self, mrapi):
+        """Test volume type spces propagation when attaching a
+           volume to an instance
+        """
+        vlmt = mfactory.VolumeTypeFactory(disk_template='ext_archipelago')
+        # Generate 4 specs. 2 prefixed with GNT_EXTP_VOLTYPESPEC_PREFIX
+        # and 2 with an other prefix that should be omitted
+        volume_type_specs = [
+            mfactory.VolumeTypeSpecsFactory(
+                volume_type=vlmt, key='%sbar' % GNT_EXTP_VOLTYPESPEC_PREFIX),
+            mfactory.VolumeTypeSpecsFactory(
+                volume_type=vlmt, key='%sfoo' % GNT_EXTP_VOLTYPESPEC_PREFIX),
+            mfactory.VolumeTypeSpecsFactory(
+                volume_type=vlmt, key='other-prefx-baz'),
+            mfactory.VolumeTypeSpecsFactory(
+                volume_type=vlmt, key='another-prefix-biz'),
+        ]
+
+        gnt_prefixed_specs = filter(lambda s: s.key.startswith(
+            GNT_EXTP_VOLTYPESPEC_PREFIX), volume_type_specs)
+        volume = mfactory.VolumeFactory(volume_type=vlmt, size=1)
+        vm = volume.machine
+        osettings = {
+            "GANETI_DISK_PROVIDER_KWARGS": {
+                "archipelago": {
+                    "foo": "mpaz",
+                    "lala": "lolo"
+                }
+            }
+        }
+
+        with override_settings(settings, **osettings):
+            mrapi().ModifyInstance.return_value = 1
+            jobid = backend.attach_volume(vm, volume)
+            self.assertEqual(jobid, 1)
+            name, args, kwargs = mrapi().ModifyInstance.mock_calls[-1]
+
+            disk_kwargs = {"provider": "archipelago",
+                           "name": vm.volumes.all()[0].backend_volume_uuid,
+                           "reuse_data": 'False',
+                           "foo": "mpaz",
+                           "lala": "lolo",
+                           "size": 1024}
+            disk_kwargs.update({spec.key[len(GNT_EXTP_VOLTYPESPEC_PREFIX):]:
+                                spec.value
+                                for spec in gnt_prefixed_specs})
+
+        # Should be "disks": [('add', '-1', {disk_kwargs}), ]
+        disk = kwargs["disks"][0]
+        self.assertEqual(disk[0], 'add')
+        self.assertEqual(disk[1], '-1')
+        self.assertEqual(disk[2], disk_kwargs)
+
     def test_attach_wait_for_sync(self, mrapi):
         """Test wait_for_sync when attaching volume to instance.
 
@@ -185,6 +268,7 @@ class ServerTest(TransactionTestCase):
 
 @patch("synnefo.logic.rapi_pool.GanetiRapiClient")
 class ServerCommandTest(TransactionTestCase):
+
     def test_pending_task(self, mrapi):
         vm = mfactory.VirtualMachineFactory(task="REBOOT", task_job_id=1)
         self.assertRaises(faults.BadRequest, servers.start, vm)
@@ -219,7 +303,7 @@ class ServerCommandTest(TransactionTestCase):
             self.assertRaises(faults.BadRequest, servers.connect, vm, network)
             self.assertRaises(faults.BadRequest, servers.disconnect, vm,
                               network)
-        #test valid
+        # test valid
         vm = mfactory.VirtualMachineFactory(operstate="STOPPED")
         mrapi().StartupInstance.return_value = 1
         with mocked_quotaholder():
@@ -316,8 +400,9 @@ class ServerCommandTest(TransactionTestCase):
         vm = volume.machine
         another_project = "another_project"
         with mocked_quotaholder():
-            servers.reassign(vm, another_project)
+            servers.reassign(vm, another_project, False)
             self.assertEqual(vm.project, another_project)
+            self.assertEqual(vm.shared_to_project, False)
             vol = vm.volumes.get(id=volume.id)
             self.assertNotEqual(vol.project, another_project)
 
@@ -327,7 +412,73 @@ class ServerCommandTest(TransactionTestCase):
         vm = volume.machine
         another_project = "another_project"
         with mocked_quotaholder():
-            servers.reassign(vm, another_project)
+            servers.reassign(vm, another_project, True)
             self.assertEqual(vm.project, another_project)
+            self.assertEqual(vm.shared_to_project, True)
             vol = vm.volumes.get(id=volume.id)
             self.assertEqual(vol.project, another_project)
+            self.assertEqual(vol.shared_to_project, True)
+
+    def test_reassign_vm_backends(self, mrapi):
+        volume = mfactory.VolumeFactory()
+        vm = volume.machine
+        original_project = vm.project
+        another_project = "another_project"
+        with mocked_quotaholder():
+            servers.reassign(vm, another_project, False)
+            self.assertEqual(vm.project, another_project)
+            self.assertEqual(vm.shared_to_project, False)
+            vol = vm.volumes.get(id=volume.id)
+            self.assertNotEqual(vol.project, another_project)
+
+        backend = vm.backend
+        backend.public = False
+        backend.save()
+        with mocked_quotaholder():
+            self.assertRaises(faults.Forbidden, servers.reassign, vm,
+                              original_project, False)
+            self.assertEqual(vm.project, another_project)
+            self.assertEqual(vm.shared_to_project, False)
+            vol = vm.volumes.get(id=volume.id)
+            self.assertNotEqual(vol.project, another_project)
+
+        mfactory.ProjectBackendFactory(project=original_project,
+                                       backend=backend)
+        with mocked_quotaholder():
+            servers.reassign(vm, original_project, False)
+            self.assertEqual(vm.project, original_project)
+            self.assertEqual(vm.shared_to_project, False)
+            vol = vm.volumes.get(id=volume.id)
+            self.assertEqual(vol.project, original_project)
+
+    def test_reassign_vm_flavors(self, mrapi):
+        volume = mfactory.VolumeFactory()
+        vm = volume.machine
+        original_project = vm.project
+        another_project = "another_project"
+        with mocked_quotaholder():
+            servers.reassign(vm, another_project, False)
+            self.assertEqual(vm.project, another_project)
+            self.assertEqual(vm.shared_to_project, False)
+            vol = vm.volumes.get(id=volume.id)
+            self.assertNotEqual(vol.project, another_project)
+
+        flavor = vm.flavor
+        flavor.public = False
+        flavor.save()
+        with mocked_quotaholder():
+            self.assertRaises(faults.Forbidden, servers.reassign, vm,
+                              original_project, False)
+            self.assertEqual(vm.project, another_project)
+            self.assertEqual(vm.shared_to_project, False)
+            vol = vm.volumes.get(id=volume.id)
+            self.assertNotEqual(vol.project, another_project)
+
+        mfactory.FlavorAccessFactory(project=original_project,
+                                     flavor=flavor)
+        with mocked_quotaholder():
+            servers.reassign(vm, original_project, False)
+            self.assertEqual(vm.project, original_project)
+            self.assertEqual(vm.shared_to_project, False)
+            vol = vm.volumes.get(id=volume.id)
+            self.assertEqual(vol.project, original_project)

@@ -21,6 +21,10 @@ ADMIN_STATS_PERMITTED_GROUPS = ["admin-stats"]
 # of the 'volume' app.
 CYCLADES_SNAPSHOTS_ENABLED = True
 
+# Enable/Disable the feature of a sharing a resource to the members of the
+# project to which it belongs, at the API level.
+CYCLADES_SHARED_RESOURCES_ENABLED = False
+
 #
 # Network Configuration
 #
@@ -181,5 +185,27 @@ CYCLADES_VOLUME_MAX_SIZE = 200
 # The maximum allowed metadata items for a Cyclades Volume
 CYCLADES_VOLUME_MAX_METADATA = 10
 
+# The volume types that Cyclades allow to be detached
+CYCLADES_DETACHABLE_DISK_TEMPLATES = ("ext_archipelago", "ext_vlmc")
+
 # The maximmum allowed metadata items for a Cyclades Virtual Machine
 CYCLADES_VM_MAX_METADATA = 10
+
+# Define cache for public stats
+PUBLIC_STATS_CACHE = {
+    "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+    "LOCATION": "",
+    "KEY_PREFIX": "publicstats",
+    "TIMEOUT": 300,
+}
+
+# Permit users of specific groups to override the flavor allow_create policy
+CYCLADES_FLAVOR_OVERRIDE_ALLOW_CREATE = {}
+
+# Define cache for VM password
+VM_PASSWORD_CACHE = {
+    "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+    "LOCATION": "",
+    "KEY_PREFIX": "vmpassword",
+    "TIMEOUT": None,
+}

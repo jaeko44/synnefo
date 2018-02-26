@@ -5,6 +5,62 @@ Unified NEWS file for Synnefo versions >= 0.13
 
 Since v0.13 all Synnefo components have been merged into a single repository.
 
+.. _NEWS-0.19:
+
+v0.19
+=====
+
+Released: Fri Jun 23 10:45:02 EEST 2017
+
+The Synnefo 0.19 release brings an upgrade to Debian Jessie. All users are
+strongly encouraged to upgrade. Please see the Synnefo documentation for
+upgrade instructions to v0.19.
+
+Apart from the platform upgrade, the most notable changes are:
+
+* Enhancements in VM allocation policy
+* Support for the keypairs API for ssh key management
+* Improved OpenStack compatibility
+* Improved IP usage history
+
+.. _NEWS-0.18.1:
+
+v0.18.1
+=======
+
+Released: Wed Oct 12 12:32:04 EEST 2016
+
+The Synnefo 0.18.1 release brings significant improvements across Synnefo.
+
+The most notable changes are:
+
+* Improved project management and quota policy enforcement
+* Performance optimizations of Pithos object listing queries
+* Support for modifying user e-mails from the Admin Panel
+* Various Admin panel enhancements
+* Support for multiple eventd instances and automatic ganeti master failover
+  detection
+* Support for Sentry
+
+.. _NEWS-0.17:
+
+v0.17
+=====
+
+Released: Thu Apr 28 12:35:46 EEST 2016
+
+The Synnefo 0.17 release brings major new features and significant bug fixes
+across Synnefo. All users are strongly encouraged to upgrade. Please see
+the Synnefo documentation for upgrade instructions to v0.17.
+
+The most notables changes are:
+
+* Cyclades shared resources among members of a project.
+* Cyclades support for detachable volumes
+* Brand new pithos UI web application
+* Support LDAP authentication in Astakos service
+
+
 .. _NEWS-0.16.2:
 
 v0.16.2

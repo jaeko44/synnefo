@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2017 GRNET S.A. and individual contributors
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -13,8 +13,10 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-from django.utils import simplejson as json
-from snf_django.utils.testing import BaseAPITest, mocked_quotaholder
+import json
+from django.conf import settings
+from snf_django.utils.testing import BaseAPITest, mocked_quotaholder, \
+    with_settings
 from synnefo.db.models import IPAddress, Network, Subnet, IPPoolTable
 from synnefo.db import models_factory as mf
 
@@ -23,6 +25,7 @@ from mock import patch, Mock
 from synnefo.cyclades_settings import cyclades_services
 from synnefo.lib.services import get_service_path
 from synnefo.lib import join_urls
+from synnefo.db import transaction
 
 
 network_path = get_service_path(cyclades_services, "network", version="v2.0")
@@ -62,6 +65,7 @@ class FloatingIPAPITest(BaseAPITest):
                           "deleted": False,
                           "user_id": "user1",
                           "tenant_id": "user1",
+                          "shared_to_project": False,
                           "floating_network_id": str(ip.network_id)})
 
     def test_get_ip(self):
@@ -80,11 +84,41 @@ class FloatingIPAPITest(BaseAPITest):
                           "deleted": False,
                           "user_id": "user1",
                           "tenant_id": "user1",
+                          "shared_to_project": False,
                           "floating_network_id": str(ip.network_id)})
 
     def test_wrong_user(self):
         ip = mf.IPv4AddressFactory(userid="user1", floating_ip=True)
         response = self.delete(URL + "/%s" % ip.id, "user2")
+        self.assertItemNotFound(response)
+
+    @with_settings(settings, CYCLADES_SHARED_RESOURCES_ENABLED=True)
+    def test_sharing(self):
+        ip = mf.IPv4AddressFactory(userid="user1", floating_ip=True)
+        action = {"reassign": {
+            "shared_to_project": True, "project": "project1"
+        }}
+        response = self.post(URL + "/%s/action" % ip.id, "user1",
+                             json.dumps(action))
+        self.assertSuccess(response)
+
+        response = self.delete(URL + "/%s" % ip.id, "user2",
+                               _projects=["user2", "project1"])
+        # 409 instead of 404
+        self.assertEqual(response.status_code, 409)
+
+        action['reassign']['shared_to_project'] = False
+        response = self.post(URL + "/%s/action" % ip.id, "user2",
+                             json.dumps(action))
+        self.assertItemNotFound(response)
+
+        action['reassign']['shared_to_project'] = False
+        response = self.post(URL + "/%s/action" % ip.id, "user1",
+                             json.dumps(action))
+        self.assertSuccess(response)
+
+        response = self.delete(URL + "/%s" % ip.id, "user2",
+                               _projects=["user2", "project1"])
         self.assertItemNotFound(response)
 
     def test_deleted_ip(self):
@@ -114,6 +148,7 @@ class FloatingIPAPITest(BaseAPITest):
                           "deleted": False,
                           "user_id": "test_user",
                           "tenant_id": "test_user",
+                          "shared_to_project": False,
                           "floating_network_id": str(self.pool.id)})
 
     def test_reserve_empty_body(self):
@@ -145,7 +180,7 @@ class FloatingIPAPITest(BaseAPITest):
         self.assertEqual(db_fip.address, floating_ip["floating_ip_address"])
         self.assertTrue(db_fip.floating_ip)
         # Test that address is reserved
-        ip_pool = p1.get_ip_pools()[0]
+        ip_pool = p1.get_ip_pools(locked=False)[0]
         self.assertFalse(ip_pool.is_available(db_fip.address))
 
     def test_reserve_no_pool(self):
@@ -190,6 +225,7 @@ class FloatingIPAPITest(BaseAPITest):
                           "deleted": False,
                           "user_id": "test_user",
                           "tenant_id": "test_user",
+                          "shared_to_project": False,
                           "floating_network_id": str(self.pool.id)})
 
         # Already reserved
@@ -198,7 +234,8 @@ class FloatingIPAPITest(BaseAPITest):
         self.assertFault(response, 409, "conflict")
 
         # Used by instance
-        self.pool.reserve_address("192.168.2.20")
+        with transaction.commit_on_success():
+            self.pool.reserve_address("192.168.2.20")
         request = {"floatingip": {
             "floating_network_id": self.pool.id,
             "floating_ip_address": "192.168.2.20"}
@@ -332,7 +369,7 @@ class FloatingIPAPITest(BaseAPITest):
         ips_after = floating_ips.filter(id=ip.id)
         self.assertEqual(len(ips_after), 0)
 
-    @patch("synnefo.logic.backend", Mock())
+    @patch("synnefo.logic.networks.backend_mod", Mock())
     def test_delete_network_with_floating_ips(self):
         ip = mf.IPv4AddressFactory(userid="user1", floating_ip=True,
                                    network=self.pool, nic=None)

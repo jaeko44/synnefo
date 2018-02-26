@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2016 GRNET S.A.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -210,6 +210,7 @@ UNIQUE_PROJECT_NAME_CONSTRAIN_ERR = (
     'The project name (as specified in its application\'s definition) must '
     'be unique among all active projects.')
 NOT_ALIVE_PROJECT = 'Project %s is not alive.'
+NOT_INITIALIZED_PROJECT = 'Project %s is not initialized.'
 SUSPENDED_PROJECT = 'Project %s is suspended.'
 NOT_SUSPENDED_PROJECT = 'Project %s is not suspended.'
 NOT_TERMINATED_PROJECT = 'Project %s is not terminated.'
@@ -226,9 +227,9 @@ MEMBERSHIP_ASSOCIATED = 'Request or membership already exists.'
 NO_APPLICANT = (
     'Project application requires at least one applicant. None found.')
 INVALID_PROJECT_START_DATE = (
-    'Project start date should be equal or greater than the current date.')
+    'Project start date should be equal to or greater than the current date.')
 INVALID_PROJECT_END_DATE = (
-    'Project end date should be equal or greater than than the current date.')
+    'Project end date should be equal to or greater than the current date.')
 INCONSISTENT_PROJECT_DATES = (
     'Project end date should be greater than the project start date.')
 ADD_PROJECT_MEMBERS_Q_HELP = (
@@ -333,7 +334,7 @@ AUTH_PROVIDER_ADD_TO_EXISTING_ACCOUNT = (
 
 # Email subjects
 _SITENAME = branding_settings.SERVICE_NAME
-PLAIN_EMAIL_SUBJECT = 'New email from %s' % _SITENAME
+PLAIN_EMAIL_SUBJECT = 'New e-mail from %s' % _SITENAME
 INVITATION_EMAIL_SUBJECT = 'Invitation to %s' % _SITENAME
 GREETING_EMAIL_SUBJECT = 'Welcome to %s' % _SITENAME
 FEEDBACK_EMAIL_SUBJECT = 'Feedback from %s' % _SITENAME
@@ -341,8 +342,10 @@ VERIFICATION_EMAIL_SUBJECT = '%s account verification' % _SITENAME
 ACCOUNT_CREATION_SUBJECT = '%s account created (%%(user)s)' % _SITENAME
 HELPDESK_NOTIFICATION_EMAIL_SUBJECT = \
     '%s account activated (%%(user)s)' % _SITENAME
-EMAIL_CHANGE_EMAIL_SUBJECT = 'Email change on %s ' % _SITENAME
-PASSWORD_RESET_EMAIL_SUBJECT = 'Password reset on %s ' % _SITENAME
+EMAIL_CHANGE_NEW_EMAIL_SUBJECT = '%s e-mail change notification' % _SITENAME
+EMAIL_CHANGE_OLD_EMAIL_SUBJECT = '%s e-mail change notification' % _SITENAME
+EMAIL_ADMIN_APPLICATION_APPROVED = "%s project application approved ({0})" % _SITENAME
+PASSWORD_RESET_EMAIL_SUBJECT = 'Password reset on %s' % _SITENAME
 PROJECT_CREATION_SUBJECT = \
     '%s application for a new project created (%%s)' % _SITENAME
 PROJECT_MODIFICATION_SUBJECT = \
@@ -367,6 +370,7 @@ PROJECT_MEMBERSHIP_REQUEST_SUBJECT = \
     '%s project membership request (%%(name)s)' % _SITENAME
 PROJECT_MEMBERSHIP_LEAVE_REQUEST_SUBJECT = \
     '%s project membership leave request (%%(name)s)' % _SITENAME
+INVALID_RESOURCE_DATA = "Invalid resource data"
 
 
 messages = locals().keys()

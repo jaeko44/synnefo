@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2016 GRNET S.A.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -20,6 +20,7 @@ from django.core.management.base import CommandError
 from snf_django.management.commands import SynnefoCommand
 from synnefo.management import common
 from synnefo.logic import ips
+from synnefo.db import transaction
 
 
 class Command(SynnefoCommand):
@@ -39,8 +40,11 @@ class Command(SynnefoCommand):
             dest='user',
             default=None,
             help='The owner of the floating IP'),
+        make_option("--project", dest="project",
+            help="Unique identifier of the project of the floating IP"),
     )
 
+    @transaction.commit_on_success
     @common.convert_api_faults
     def handle(self, *args, **options):
         if args:
@@ -49,9 +53,12 @@ class Command(SynnefoCommand):
         network_id = options['network_id']
         address = options['address']
         user = options['user']
+        project = options['project']
 
         if not user:
             raise CommandError("'user' is required for floating IP creation")
+        if not project:
+            project = user
 
         if network_id is not None:
             network = common.get_resource("network", network_id,
@@ -65,6 +72,7 @@ class Command(SynnefoCommand):
             network = None
 
         floating_ip = ips.create_floating_ip(userid=user,
+                                             project=project,
                                              network=network,
                                              address=address)
 

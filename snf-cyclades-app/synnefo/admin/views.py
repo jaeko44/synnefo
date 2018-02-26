@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2016 GRNET S.A.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -15,7 +15,7 @@
 
 import logging
 from django import http
-from django.utils import simplejson as json
+import json
 from django.conf import settings
 from snf_django.lib import api
 from snf_django.lib.api import faults
@@ -31,6 +31,15 @@ logger = logging.getLogger(__name__)
 @api.allow_jsonp()
 def get_public_stats(request):
     _stats = stats.get_public_stats()
+    data = json.dumps(_stats)
+    return http.HttpResponse(data, status=200, content_type='application/json')
+
+
+@api.api_method(http_method='GET', user_required=False, token_required=False,
+                logger=logger, serializations=['json'])
+@api.allow_jsonp()
+def get_public_stats_from_cache(request):
+    _stats = stats.get_public_stats_from_cache()
     data = json.dumps(_stats)
     return http.HttpResponse(data, status=200, content_type='application/json')
 

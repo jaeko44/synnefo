@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2017 GRNET S.A.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -33,7 +33,7 @@ from django.contrib.contenttypes.models import ContentType
 
 from django.db.models import Q
 from django.core.urlresolvers import reverse
-from django.utils.http import int_to_base36
+from django.utils.http import urlsafe_base64_encode
 from django.contrib.auth.tokens import default_token_generator
 from django.conf import settings
 from django.utils.importlib import import_module
@@ -745,7 +745,11 @@ class AstakosUser(User):
         return ",".join(["%s:%s" % (p.module, p.identifier or '') for p in
                          self.get_enabled_auth_providers()])
 
-    def add_auth_provider(self, module='local', identifier=None, **params):
+    def add_auth_provider(self, module='local', identifier='', **params):
+        if identifier is None:
+            logger.warn('Found identifier = None, '
+                        'should be empty string instead')
+            identifier = ''
         provider = auth.get_provider(module, self, identifier, **params)
         provider.add_to_user()
 
@@ -764,7 +768,7 @@ class AstakosUser(User):
     def get_password_reset_url(self, token_generator=default_token_generator):
         return reverse('astakos.im.views.target.local.password_reset_confirm',
                        urlconf="synnefo.webproject.urls",
-                       kwargs={'uidb36': int_to_base36(self.id),
+                       kwargs={'uidb64': urlsafe_base64_encode(str(self.id)),
                                'token': token_generator.make_token(self)})
 
     def get_inactive_message(self, provider_module, identifier=None):
@@ -996,8 +1000,8 @@ class AstakosUserAuthProvider(models.Model):
     module = models.CharField(_('Provider'), max_length=255, blank=False,
                               default='local')
     identifier = models.CharField(_('Third-party identifier'),
-                                  max_length=255, null=True,
-                                  blank=True)
+                                  max_length=255, null=False,
+                                  blank=True, default='')
     active = models.BooleanField(default=True)
     auth_backend = models.CharField(_('Backend'), max_length=255, blank=False,
                                     default='astakos')
@@ -1106,7 +1110,6 @@ class Invitation(models.Model):
 
 class EmailChangeManager(models.Manager):
 
-    @transaction.commit_on_success
     def change_email(self, activation_key):
         """
         Validate an activation key and change the corresponding
@@ -1359,8 +1362,7 @@ class ProjectApplication(models.Model):
                               related_name='chained_apps',
                               db_column='chain')
     name = models.CharField(max_length=MAX_NAME_LENGTH, null=True)
-    homepage = models.URLField(max_length=MAX_HOMEPAGE_LENGTH, null=True,
-                               verify_exists=False)
+    homepage = models.URLField(max_length=MAX_HOMEPAGE_LENGTH, null=True)
     description = models.TextField(null=True, blank=True)
     start_date = models.DateTimeField(null=True, blank=True)
     end_date = models.DateTimeField(null=True)
@@ -1703,8 +1705,7 @@ class Project(models.Model):
         db_index=True)
     realname = models.CharField(max_length=ProjectApplication.MAX_NAME_LENGTH)
     homepage = models.URLField(
-        max_length=ProjectApplication.MAX_HOMEPAGE_LENGTH,
-        verify_exists=False)
+        max_length=ProjectApplication.MAX_HOMEPAGE_LENGTH)
     description = models.TextField(blank=True)
     end_date = models.DateTimeField()
     member_join_policy = models.IntegerField()
@@ -1979,7 +1980,8 @@ class ProjectLogManager(models.Manager):
     def last_deactivations(self, projects):
         logs = self.filter(
             project__in=projects,
-            to_state__in=Project.DEACTIVATED_STATES).order_by("-date")
+            to_state__in=Project.DEACTIVATED_STATES
+        ).order_by("project", "-date")
         return first_of_group(lambda l: l.project_id, logs)
 
 
@@ -2077,8 +2079,14 @@ class ProjectMembership(models.Model):
 
     ACTUALLY_ACCEPTED = set([ACCEPTED, LEAVE_REQUESTED])
 
+    DEACTIVATED_STATES = {USER_SUSPENDED, REMOVED}
+
     state = models.IntegerField(default=REQUESTED,
                                 db_index=True)
+    OVERQUOTA_OK = 'OK'
+    overquota_state = models.CharField(max_length=255, default=OVERQUOTA_OK)
+    overquota_state_date = models.DateTimeField(auto_now_add=True)
+    overquota_date = models.DateTimeField(default=None, null=True)
 
     initialized = models.BooleanField(default=False)
     objects = ProjectMembershipManager()
@@ -2155,6 +2163,8 @@ class ProjectMembership(models.Model):
         "remove": lambda m: m.state in m.ACCEPTED_STATES,
         "reject": lambda m: m.state == m.REQUESTED,
         "cancel": lambda m: m.state == m.REQUESTED,
+        "suspend": lambda m: m.state in m.ACTUALLY_ACCEPTED,
+        "unsuspend": lambda m: m.state == m.USER_SUSPENDED,
     }
 
     ACTION_STATES = {
@@ -2167,6 +2177,8 @@ class ProjectMembership(models.Model):
         "remove":        REMOVED,
         "reject":        REJECTED,
         "cancel":        CANCELLED,
+        "suspend":       USER_SUSPENDED,
+        "unsuspend":     ACCEPTED,
     }
 
     def check_action(self, action):

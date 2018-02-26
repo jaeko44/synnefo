@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2016 GRNET S.A.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -89,6 +89,7 @@ DEFAULT_ADMIN_RBAC = {
         'verify': [ADMIN_GROUP],
         'resend_verification': [ADMIN_GROUP],
         'contact': [ADMIN_HELPDESK_GROUP, ADMIN_GROUP],
+        'modify_email': [ADMIN_HELPDESK_GROUP, ADMIN_GROUP],
     }, 'vm': {
         'start': [ADMIN_HELPDESK_GROUP, ADMIN_GROUP],
         'shutdown': [ADMIN_HELPDESK_GROUP, ADMIN_GROUP],
@@ -142,3 +143,7 @@ ADMIN_LIMIT_SUSPENDED_VMS_IN_SUMMARY = getattr(
 
 # The sign that will indicate that a filter term concerns a model field.
 ADMIN_FIELD_SIGN = getattr(settings, 'ADMIN_FIELD_SIGN', '=')
+
+# The sign that will indicate that an OR operation will be performed
+# between terms.
+ADMIN_OR_SIGN = getattr(settings, 'ADMIN_OR_SIGN', 'OR')

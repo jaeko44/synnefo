@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2017 GRNET S.A.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -28,7 +28,7 @@ from snf_django.management import utils
 from snf_django.lib.astakos import UserCache
 from snf_django.utils.line_logging import NewlineStreamHandler
 
-import distutils
+from distutils.util import strtobool
 
 USER_EMAIL_FIELD = "user.email"
 LOGGER_EXCLUDE_COMMANDS = "-list$|-show$"
@@ -62,6 +62,8 @@ class SynnefoOutputWrapper(object):
         if self.logger is not None:
             self.logger.info(msg)
         if self.django_wrapper is not None:
+            if 'ending' not in kwargs:
+                kwargs['ending'] = b'\n'
             self.django_wrapper.write(msg, *args, **kwargs)
 
 
@@ -89,6 +91,7 @@ class SynnefoCommand(BaseCommand):
                  "csv [comma-separated output]"),
     )
 
+    umask = None
     stdout = SynnefoOutputWrapper()
     stderr = SynnefoOutputWrapper()
 
@@ -109,6 +112,9 @@ class SynnefoCommand(BaseCommand):
         using user's preferred encoding.
 
         """
+        if self.umask is not None:
+            os.umask(self.umask)
+
         curr_time = datetime.datetime.now()
         curr_time = datetime.datetime.strftime(curr_time, "%y%m%d%H%M%S")
         command = argv[1]
@@ -151,11 +157,9 @@ class SynnefoCommand(BaseCommand):
                 file_handler.setLevel(logging.DEBUG)
                 file_handler.setFormatter(formatter)
 
-                # Change all loggers to use our new file_handler
-                all_loggers = logging.Logger.manager.loggerDict.keys()
-                for logger_name in all_loggers:
-                    logger = logging.getLogger(logger_name)
-                    logger.addHandler(file_handler)
+                # Change root logger to use our new file_handler
+                root_logger = logging.getLogger('')
+                root_logger.addHandler(file_handler)
 
                 # Create our new logger
                 logger = logging.getLogger(basename)
@@ -253,6 +257,9 @@ class ListCommand(SynnefoCommand):
     a user's UUID or display name. The "--displayname" option will append
     the displayname of ther user with "user_uuid_field" to the output.
 
+    If the ``project_uuid_field`` is declared, then "--project" option will
+    become available. It allows filtering via a project's UUID.
+
     * Pretty printing output to a nice table.
 
     """
@@ -263,6 +270,8 @@ class ListCommand(SynnefoCommand):
     object_class = None
     # The name of the field containg the user ID of the user, if any.
     user_uuid_field = None
+    # The name of the field containg the project ID of the project, if any.
+    project_uuid_field = None
     # The name of the field containg the deleted flag, if any.
     deleted_field = None
     # Dictionary with all available fields
@@ -339,6 +348,16 @@ class ListCommand(SynnefoCommand):
                     help="Include the user's email"),
             )
 
+        if self.project_uuid_field:
+            self.option_list += (
+                make_option(
+                    "-p", "--project",
+                    dest="project",
+                    metavar="PROJECT",
+                    help="List items only for this project."
+                         " 'PROJECT' can be a project UUID"),
+            )
+
         if self.deleted_field:
             self.option_list += (
                 make_option(
@@ -400,6 +419,11 @@ class ListCommand(SynnefoCommand):
                 ucache = UserCache(self.astakos_auth_url, self.astakos_token)
                 user = ucache.get_uuid(user)
             self.filters[self.user_uuid_field] = user
+
+        # --project option
+        project = options.get("project")
+        if project:
+            self.filters[self.project_uuid_field] = project
 
         # --deleted option
         if self.deleted_field:
@@ -523,7 +547,7 @@ class RemoveCommand(SynnefoCommand):
         self.stdout.write("Are you sure you want to delete %s %s?"
                           " [Y/N] " % (resource, ids))
         try:
-            answer = distutils.util.strtobool(raw_input())
+            answer = strtobool(raw_input())
             if answer != 1:
                 raise CommandError("Aborting deletion")
         except ValueError:

@@ -11,3 +11,11 @@ PROJECTS="\
  snf-pithos-app\
  snf-admin-app\
  snf-tools"
+
+# django-nose > 1.4.3 breaks django 1.7 support
+# factory_boy 2.5 requires upgrading to new style Factory
+DEV_PACKAGES="\
+ mock\
+ factory_boy==2.4.1\
+ django-nose==1.4.3\
+ coverage"

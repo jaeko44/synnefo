@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2015 GRNET S.A. and individual contributors
+# Copyright (C) 2010-2016 GRNET S.A. and individual contributors
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -15,7 +15,7 @@
 
 import re
 import datetime
-import simplejson
+import json
 import copy
 import os
 from snfdeploy import base
@@ -362,9 +362,6 @@ class APT(base.Component):
 
     def _configure(self):
         return [
-            ("/etc/apt/sources.list.d/debian.backports.wheezy.list", {}, {}),
-            ("/etc/apt/sources.list.d/archipelago.wheezy.list", {}, {}),
-            ("/etc/apt/sources.list.d/synnefo.wheezy.list", {}, {}),
             ("/etc/apt/sources.list.d/ceph.list", {}, {}),
             ]
 
@@ -796,11 +793,9 @@ class Image(base.Component):
     @base.run_cmds
     def prepare(self):
         url = config.debian_base_url
-        d = config.images_dir
-        image = "debian_base.diskdump"
+        image = config.debian_base_image
         return [
-            "test -e /tmp/%s || wget -4 %s -O /tmp/%s" % (image, url, image),
-            "cp /tmp/%s %s/%s" % (image, d, image),
+            "test -e %s || wget -4 %s -O %s" % (image, url, image),
             "mv /etc/default/snf-image /etc/default/snf-image.orig",
             ]
 
@@ -942,16 +937,16 @@ class Apache(base.Component):
     @base.run_cmds
     def prepare(self):
         return [
-            "a2enmod ssl", "a2enmod rewrite", "a2dissite default",
+            "a2enmod ssl", "a2enmod rewrite", "a2dissite 000-default",
             "a2enmod headers",
-            "a2enmod proxy_http", "a2dismod autoindex",
+            "a2enmod proxy_http", "a2dismod -f autoindex",
             ]
 
     def _configure(self):
         r1 = {"domain": self.node.domain}
         return [
-            ("/etc/apache2/sites-available/synnefo", r1, {}),
-            ("/etc/apache2/sites-available/synnefo-ssl", r1, {}),
+            ("/etc/apache2/sites-available/synnefo.conf", r1, {}),
+            ("/etc/apache2/sites-available/synnefo-ssl.conf", r1, {}),
             ("/root/firefox_cert_override.py", {}, {})
             ]
 
@@ -979,6 +974,12 @@ class Gunicorn(base.Component):
         return [
             ("/etc/gunicorn.d/synnefo", r1, {}),
             ]
+
+    @base.run_cmds
+    def prepare(self):
+        return [
+            "mkdir -p /etc/synnefo",
+        ]
 
     @base.run_cmds
     def restart(self):
@@ -1173,10 +1174,7 @@ class Astakos(base.Component):
     @base.run_cmds
     def initialize(self):
         return [
-            "snf-manage syncdb --noinput",
-            "snf-manage migrate im --delete-ghost-migrations",
-            "snf-manage migrate quotaholder_app",
-            "snf-manage migrate oa2",
+            "snf-manage migrate",
             "snf-manage loaddata groups",
             ] + self._astakos_oa2() + self._astakos_register_components()
 
@@ -1274,8 +1272,7 @@ class CMS(base.Component):
     @base.run_cmds
     def initialize(self):
         return [
-            "snf-manage syncdb",
-            "snf-manage migrate --delete-ghost-migrations",
+            "snf-manage migrate",
             "snf-manage loaddata /tmp/sites.json",
             "snf-manage loaddata /tmp/page.json",
             "snf-manage createsuperuser --username=admin \
@@ -1374,7 +1371,7 @@ EOF
 class Pithos(base.Component):
     REQUIRED_PACKAGES = [
         "snf-pithos-app",
-        "snf-pithos-webclient",
+        "snf-ui-app",
         ]
 
     alias = constants.PITHOS
@@ -1404,14 +1401,6 @@ class Pithos(base.Component):
             "snf-manage service-export-pithos > %s" % f
             ]
 
-    @base.run_cmds
-    def prepare(self):
-        return [
-            # FIXME: Workaround until snf-pithos-webclient creates conf
-            # files properly with root:synnefo
-            "chown root:synnefo /etc/synnefo/*snf-pithos-webclient*conf",
-            ]
-
     def _configure(self):
         r1 = {
             "ACCOUNTS": self.ctx.astakos.cname,
@@ -1425,11 +1414,12 @@ class Pithos(base.Component):
         r2 = {
             "ACCOUNTS": self.ctx.astakos.cname,
             "PITHOS_UI_CLOUDBAR_ACTIVE_SERVICE": context.service_id,
+            "UI_BASE_URL": "/pithos/ui/"
             }
 
         return [
             ("/etc/synnefo/pithos.conf", r1, {}),
-            ("/etc/synnefo/webclient.conf", r2, {}),
+            ("/etc/synnefo/ui.conf", r2, {}),
             ]
 
     @base.run_cmds
@@ -1523,6 +1513,38 @@ snf-manage network-create --subnet6={0} \
 
         return [cmd]
 
+    @update_admin
+    @base.run_cmds
+    def sync_helper_servers(self):
+        """Create the smallest possible Archipelago helper VM.
+
+        If there is no Archipelago flavor, then we can exit.
+        """
+        storage_flavor = "ext_archipelago"
+        if storage_flavor not in config.flavor_storage:
+            return []
+        cpu_flavor = config.flavor_cpu[0]
+        ram_flavor = config.flavor_ram[0]
+        disk_flavor = config.flavor_disk[0]
+
+        # Get the admin user UUID
+        self.DB.get_user_info_from_db(config.user_email)
+
+        # Get the smallest Archipelago flavor by parsing the `snf-manage
+        # flavor-list` command.
+        flavor_id = """$(snf-manage flavor-list \
+--filter-by='cpu=%s,ram=%s,disk=%s,volume_type__disk_template=%s' | \
+awk 'END {print $1}')""" % (cpu_flavor, int(ram_flavor) * 1024, disk_flavor,
+                            storage_flavor)
+
+        # Get an image by parsing the `snf-manage image-list` command.
+        image_uuid = "$(snf-manage image-list | awk 'END {print $1}')"
+        cmd = """
+snf-manage helper-servers-sync --flavor %s --user %s --password %s --image %s
+""" % (flavor_id, context.user_uuid, config.user_passwd, image_uuid)
+
+        return [cmd]
+
     @base.run_cmds
     def export_service(self):
         f = config.jsonfile
@@ -1588,8 +1610,7 @@ snf-manage network-create --subnet6={0} \
     @base.run_cmds
     def initialize(self):
         return [
-            "snf-manage syncdb",
-            "snf-manage migrate --delete-ghost-migrations",
+            "snf-manage migrate",
             "snf-manage pool-create --type=mac-prefix \
               --base=aa:00:0 --size=65536",
             "snf-manage pool-create --type=bridge --base=prv --size=20",
@@ -1691,7 +1712,8 @@ class VNC(base.Component):
 
 class Admin(base.Component):
     REQUIRED_PACKAGES = [
-        "python-django-eztables",
+        "python-snf-django-eztables",
+        "python-libsass",
         "python-astakosclient",
         "snf-astakos-app",
         "snf-cyclades-app",
@@ -1769,41 +1791,48 @@ class Kamaki(base.Component):
 
     def _fetch_image(self):
         url = config.debian_base_url
-        image = "debian_base.diskdump"
+        image = config.debian_base_image
         return [
-            "test -e /tmp/%s || wget -4 %s -O /tmp/%s" % (image, url, image)
+            "test -e %s || wget -4 %s -O %s" % (image, url, image)
             ]
 
     def _fetch_image_meta(self):
         url = config.debian_base_url + ".meta"
-        meta = "debian_base.diskdump.meta"
+        meta = config.debian_base_image + ".meta"
         return [
-            "test -e /srv/images/%s || wget -4 %s -O /srv/images/%s" % (meta, url, meta)
+            "test -e %s || wget -4 %s -O %s" % (meta, url, meta)
             ]
 
     def _upload_image(self):
-        image = "debian_base.diskdump"
+        local = config.debian_base_image
+        remote = config.debian_base_name
         return [
-            "kamaki file upload --container images /tmp/%s %s" % (image, image)
+            "kamaki file upload --container images %s %s" % (local, remote)
             ]
 
     def _upload_image_meta(self):
-        image = "debian_base.diskdump.meta"
+        local = config.debian_base_image + ".meta"
+        remote = config.debian_base_name + ".meta"
         return [
-            "kamaki file upload --container images /srv/images/%s %s" % (image, image)
+            "kamaki file upload --container images %s %s" % (local, remote)
             ]
 
     def _register_image(self):
-        image = "debian_base.diskdump"
-        image_location = "/images/%s" % image
+        meta = config.debian_base_image + ".meta"
+        image_location = "/images/%s" % config.debian_base_name
         cmd = """
         kamaki image register --name "Debian Base" --location {0} --public \
-            --force --metafile /srv/{0}.meta
-        """.format(image_location)
+            --force --metafile {1}
+        """.format(image_location, meta)
         return [
             "sleep 5",
             cmd
             ]
+
+    @update_admin
+    @update_cluster_admin
+    def admin_post(self):
+        self.CYCLADES.sync_helper_servers()
 
     @base.run_cmds
     def test(self):
@@ -1927,7 +1956,7 @@ class Archip(base.Component):
             # FIXME: See https://github.com/grnet/archipelago/pull/44
             "mkdir -p /dev/shm/posixfd",
             "chown -R synnefo:synnefo /dev/shm/posixfd",
-            "archipelago restart",
+            "service archipelago restart",
             ]
 
 
@@ -1974,13 +2003,13 @@ class ExtStorage(base.Component):
 
 class Client(base.Component):
     REQUIRED_PACKAGES = [
-        "iceweasel"
+        "firefox-esr"
         ]
 
     alias = constants.CLIENT
 
     def required_components(self):
-        return [HW, SSH, DNS, APT, Kamaki, Burnin, Firefox]
+        return [HW, SSH, DNS, APT, Kamaki, Burnin]
 
 
 class GanetiDev(base.Component):
@@ -2005,7 +2034,7 @@ class GanetiDev(base.Component):
             "CLUSTER_NAME": self.cluster.name,
             "VG": self.cluster.vg,
             "CLUSTER_NETDEV": self.cluster.netdev,
-            "NODES": simplejson.dumps(sample_nodes),
+            "NODES": json.dumps(sample_nodes),
             "DOMAIN": self.cluster.domain,
             "COMMON_BRIDGE": config.common_bridge
             }
@@ -2044,24 +2073,3 @@ class Router(base.Component):
     REQUIRED_PACKAGES = [
         "iptables"
         ]
-
-
-class Firefox(base.Component):
-    REQUIRED_PACKAGES = [
-        "iceweasel",
-        "libnss3-tools",
-        ]
-
-    @update_admin
-    def admin_pre(self):
-        self.CA.get("/root/ca/cacert.pem", "/tmp/cacert.pem")
-        self.put("/tmp/cacert.pem", "/tmp/Synnefo_Root_CA.crt")
-
-    @base.run_cmds
-    def initialize(self):
-        return [
-            "echo 12345678 > /tmp/iceweasel_db_pass",
-            "certutil -N -d /etc/iceweasel/profile/ -f /tmp/iceweasel_db_pass",
-            "certutil -A -n synnefo -t TCu -d /etc/iceweasel/profile/ \
-              -i /tmp/Synnefo_Root_CA.crt",
-            ]

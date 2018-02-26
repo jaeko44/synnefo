@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2017 GRNET S.A. and individual contributors
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -20,7 +20,7 @@ from socket import getfqdn
 from random import choice
 from django import dispatch
 from synnefo.db import transaction
-from django.utils import simplejson as json
+import json
 
 from snf_django.lib.api import faults
 from django.conf import settings
@@ -28,12 +28,12 @@ from synnefo.api import util
 from synnefo.logic import backend, ips, utils
 from synnefo.logic.backend_allocator import BackendAllocator
 from synnefo.db.models import (NetworkInterface, VirtualMachine,
-                               VirtualMachineMetadata, IPAddressLog, Network,
-                               Image, pooled_rapi_client)
+                               VirtualMachineMetadata, IPAddressHistory,
+                               IPAddress, Network, Image, pooled_rapi_client)
 from vncauthproxy.client import request_forwarding as request_vnc_forwarding
 from synnefo.logic import rapi
 from synnefo.volume.volumes import _create_volume
-from synnefo.volume.util import get_volume
+from synnefo.volume.util import get_volume, assign_volume_to_server
 from synnefo.logic import commands
 from synnefo import quotas
 
@@ -46,7 +46,8 @@ server_created = dispatch.Signal(providing_args=["created_vm_params"])
 @transaction.commit_on_success
 def create(userid, name, password, flavor, image_id, metadata={},
            personality=[], networks=None, use_backend=None, project=None,
-           volumes=None):
+           volumes=None, helper=False, user_projects=None,
+           shared_to_project=False, key_names=None):
 
     utils.check_name_length(name, VirtualMachine.VIRTUAL_MACHINE_NAME_LENGTH,
                             "Server name is too long")
@@ -106,15 +107,22 @@ def create(userid, name, password, flavor, image_id, metadata={},
         # Image info is not critical. Continue if it fails for any reason
         log.warning("Failed to store image info: %s", e)
 
-    if use_backend is None:
-        # Allocate server to a Ganeti backend
-        use_backend = allocate_new_server(userid, flavor)
-
-    # Create the ports for the server
-    ports = create_instance_ports(userid, networks)
-
     if project is None:
         project = userid
+
+    if use_backend is None:
+        # Allocate server to a Ganeti backend
+        use_backend = allocate_new_server(userid, project, flavor)
+
+    if key_names is None:
+        key_names = []
+
+    auth_keys = '\n'.join([
+        util.get_keypair(key_name, userid).content for key_name in key_names
+    ])
+
+    # Create the ports for the server
+    ports = create_instance_ports(userid, user_projects, networks)
 
     # We must save the VM instance now, so that it gets a valid
     # vm.backend_vm_id.
@@ -122,10 +130,13 @@ def create(userid, name, password, flavor, image_id, metadata={},
                                        backend=use_backend,
                                        userid=userid,
                                        project=project,
+                                       shared_to_project=shared_to_project,
                                        imageid=image["id"],
                                        image_version=image["version"],
+                                       key_names=json.dumps(key_names),
                                        flavor=flavor,
-                                       operstate="BUILD")
+                                       operstate="BUILD",
+                                       helper=helper)
     log.info("Created entry in DB for VM '%s'", vm)
 
     # Associate the ports with the server
@@ -140,8 +151,8 @@ def create(userid, name, password, flavor, image_id, metadata={},
     for index, vol_info in enumerate(volumes):
         if vol_info["source_type"] == "volume":
             uuid = vol_info["source_uuid"]
-            v = get_volume(userid, uuid, for_update=True, non_deleted=True,
-                           exception=faults.BadRequest)
+            v = get_volume(userid, user_projects, uuid, for_update=True,
+                           non_deleted=True, exception=faults.BadRequest)
             if v.volume_type_id != server_vtype.id:
                 msg = ("Volume '%s' has type '%s' while flavor's volume type"
                        " is '%s'" % (v.id, v.volume_type_id, server_vtype.id))
@@ -150,13 +161,12 @@ def create(userid, name, password, flavor, image_id, metadata={},
                 raise faults.BadRequest("Cannot use volume while it is in %s"
                                         " status" % v.status)
             v.delete_on_termination = vol_info["delete_on_termination"]
-            v.machine = vm
-            v.index = index
-            v.save()
         else:
-            v = _create_volume(server=vm, user_id=userid,
-                               volume_type=server_vtype, project=project,
-                               index=index, **vol_info)
+            v = _create_volume(user_id=userid, volume_type=server_vtype,
+                               project=project, index=index,
+                               shared_to_project=shared_to_project,
+                               **vol_info)
+        assign_volume_to_server(vm, v, index=index)
         server_volumes.append(v)
 
     # Create instance metadata
@@ -172,13 +182,13 @@ def create(userid, name, password, flavor, image_id, metadata={},
 
     # Create the server in Ganeti.
     vm = create_server(vm, ports, server_volumes, flavor, image, personality,
-                       password)
+                       password, auth_keys)
 
     return vm
 
 
 @transaction.commit_on_success
-def allocate_new_server(userid, flavor):
+def allocate_new_server(userid, project, flavor):
     """Allocate a new server to a Ganeti backend.
 
     Allocation is performed based on the owner of the server and the specified
@@ -190,7 +200,7 @@ def allocate_new_server(userid, flavor):
 
     """
     backend_allocator = BackendAllocator()
-    use_backend = backend_allocator.allocate(userid, flavor)
+    use_backend = backend_allocator.allocate(userid, project, flavor)
     if use_backend is None:
         log.error("No available backend for VM with flavor %s", flavor)
         raise faults.ServiceUnavailable("No available backends")
@@ -198,7 +208,8 @@ def allocate_new_server(userid, flavor):
 
 
 @commands.server_command("BUILD")
-def create_server(vm, nics, volumes, flavor, image, personality, password):
+def create_server(vm, nics, volumes, flavor, image, personality, password,
+                  auth_keys):
     # dispatch server created signal needed to trigger the 'vmapi', which
     # enriches the vm object with the 'config_url' attribute which must be
     # passed to the Ganeti job.
@@ -210,13 +221,18 @@ def create_server(vm, nics, volumes, flavor, image, personality, password):
     if root_volume.volume_type.provider in settings.GANETI_CLONE_PROVIDERS:
         image_id = "null"
 
-    server_created.send(sender=vm, created_vm_params={
+    created_vm_params = {
         'img_id': image_id,
         'img_passwd': password,
         'img_format': str(image['format']),
         'img_personality': json.dumps(personality),
         'img_properties': json.dumps(image['metadata']),
-    })
+    }
+
+    if auth_keys:
+        created_vm_params['auth_keys'] = auth_keys
+
+    server_created.send(sender=vm, created_vm_params=created_vm_params)
 
     # send job to Ganeti
     try:
@@ -301,16 +317,37 @@ def _resize(vm, flavor):
 
 
 @transaction.commit_on_success
-def reassign(vm, project):
+def reassign(vm, project, shared_to_project):
     commands.validate_server_action(vm, "REASSIGN")
-    action_fields = {"to_project": project, "from_project": vm.project}
-    log.info("Reassigning VM %s from project %s to %s",
-             vm, vm.project, project)
-    vm.project = project
-    vm.save()
-    vm.volumes.filter(index=0, deleted=False).update(project=project)
-    quotas.issue_and_accept_commission(vm, action="REASSIGN",
-                                       action_fields=action_fields)
+
+    if vm.project == project:
+        if vm.shared_to_project != shared_to_project:
+            log.info("%s VM %s to project %s",
+                     "Sharing" if shared_to_project else "Unsharing",
+                     vm, project)
+            vm.shared_to_project = shared_to_project
+            vm.volumes.filter(index=0, deleted=False)\
+                      .update(shared_to_project=shared_to_project)
+            vm.save()
+    else:
+        action_fields = {"to_project": project, "from_project": vm.project}
+        log.info("Reassigning VM %s from project %s to %s, shared: %s",
+                 vm, vm.project, project, shared_to_project)
+        if not (vm.backend.public or
+                vm.backend.projects.filter(project=project).exists()):
+            raise faults.Forbidden("Cannot reassign VM. Target project "
+                                   "doesn't have access to the VM's backend.")
+        if not util.has_access_to_flavor(vm.flavor, project=project):
+            raise faults.Forbidden("Cannot reassign VM. Target project "
+                                   "doesn't have access to the VM's flavor.")
+        vm.project = project
+        vm.shared_to_project = shared_to_project
+        vm.save()
+        vm.volumes.filter(index=0, deleted=False)\
+                  .update(project=project, shared_to_project=shared_to_project)
+        quotas.issue_and_accept_commission(vm, action="REASSIGN",
+                                           action_fields=action_fields)
+    return vm
 
 
 @commands.server_command("SET_FIREWALL_PROFILE")
@@ -443,6 +480,55 @@ def rename(server, new_name):
     return server
 
 
+def show_owner_change(vmid, from_user, to_user):
+    return "[OWNER CHANGE vm: %s, from: %s, to: %s]" % (
+        vmid, from_user, to_user)
+
+
+def change_owner(server, new_owner):
+    old_owner = server.userid
+    server.userid = new_owner
+    old_project = server.project
+    server.project = new_owner
+    server.save()
+    log.info("Changed the owner of server '%s' from '%s' to '%s'.",
+             server, old_owner, new_owner)
+    log.info("Changed the project of server '%s' from '%s' to '%s'.",
+             server, old_project, new_owner)
+    for vol in server.volumes.filter(
+            userid=old_owner).select_for_update():
+        vol.userid = new_owner
+        vol_old_project = vol.project
+        vol.project = new_owner
+        vol.save()
+        log.info("Changed the owner of volume '%s' from '%s' to '%s'.",
+                 vol, old_owner, new_owner)
+        log.info("Changed the project of volume '%s' from '%s' to '%s'.",
+                 vol, vol_old_project, new_owner)
+    for nic in server.nics.filter(userid=old_owner).select_for_update():
+        nic.userid = new_owner
+        nic.save()
+        log.info("Changed the owner of port '%s' from '%s' to '%s'.",
+                 nic.id, old_owner, new_owner)
+    for ip in IPAddress.objects.filter(nic__machine=server, userid=old_owner).\
+            select_for_update().select_related("nic"):
+        ips.change_ip_owner(ip, new_owner)
+        IPAddressHistory.objects.create(
+            server_id=server.id,
+            user_id=old_owner,
+            network_id=ip.nic.network_id,
+            address=ip.address,
+            action=IPAddressHistory.DISASSOCIATE,
+            action_reason=show_owner_change(server.id, old_owner, new_owner))
+        IPAddressHistory.objects.create(
+            server_id=server.id,
+            user_id=new_owner,
+            network_id=ip.nic.network_id,
+            address=ip.address,
+            action=IPAddressHistory.ASSOCIATE,
+            action_reason=show_owner_change(server.id, old_owner, new_owner))
+
+
 @transaction.commit_on_success
 def create_port(*args, **kwargs):
     vm = kwargs.get("machine", None)
@@ -534,7 +620,8 @@ def associate_port_with_machine(port, machine):
     """Associate a Port with a VirtualMachine.
 
     Associate the port with the VirtualMachine and add an entry to the
-    IPAddressLog if the port has a public IPv4 address from a public network.
+    IPAddressHistory if the port has a public IPv4 address from a public
+    network.
 
     """
     if port.machine is not None:
@@ -542,11 +629,15 @@ def associate_port_with_machine(port, machine):
     if port.network.public:
         ipv4_address = port.ipv4_address
         if ipv4_address is not None:
-            ip_log = IPAddressLog.objects.create(server_id=machine.id,
-                                                 network_id=port.network_id,
-                                                 address=ipv4_address,
-                                                 active=True)
-            log.debug("Created IP log entry %s", ip_log)
+            ip_log = IPAddressHistory.objects.create(
+                server_id=machine.id,
+                user_id=machine.userid,
+                network_id=port.network_id,
+                address=ipv4_address,
+                action=IPAddressHistory.ASSOCIATE,
+                action_reason="associate port %s" % port.id
+            )
+            log.info("Created IP log entry %s", ip_log)
     port.machine = machine
     port.state = "BUILD"
     port.device_owner = "vm"
@@ -576,7 +667,7 @@ def delete_port(port):
     return port
 
 
-def create_instance_ports(user_id, networks=None):
+def create_instance_ports(user_id, user_projects, networks=None):
     # First connect the instance to the networks defined by the admin
     forced_ports = create_ports_for_setting(user_id, category="admin")
     if networks is None:
@@ -585,7 +676,7 @@ def create_instance_ports(user_id, networks=None):
         ports = create_ports_for_setting(user_id, category="default")
     else:
         # Else just connect to the networks that the user defined
-        ports = create_ports_for_request(user_id, networks)
+        ports = create_ports_for_request(user_id, user_projects, networks)
     total_ports = forced_ports + ports
     if len(total_ports) > settings.GANETI_MAX_NICS_PER_INSTANCE:
         raise faults.BadRequest("Maximum ports per server limit reached")
@@ -641,12 +732,14 @@ def create_ports_for_setting(user_id, category):
 def _port_from_setting(user_id, network_id, category):
     # TODO: Fix this..you need only IPv4 and only IPv6 network
     if network_id == "SNF:ANY_PUBLIC_IPV4":
-        return create_public_ipv4_port(user_id, category=category)
+        return create_public_ipv4_port(user_id, user_projects=None,
+                                       category=category)
     elif network_id == "SNF:ANY_PUBLIC_IPV6":
         return create_public_ipv6_port(user_id, category=category)
     elif network_id == "SNF:ANY_PUBLIC":
         try:
-            return create_public_ipv4_port(user_id, category=category)
+            return create_public_ipv4_port(user_id, user_projects=None,
+                                           category=category)
         except faults.Conflict as e1:
             try:
                 return create_public_ipv6_port(user_id, category=category)
@@ -660,13 +753,14 @@ def _port_from_setting(user_id, network_id, category):
         if category in ["user", "default"]:
             return _port_for_request(user_id, {"uuid": network_id})
         elif category == "admin":
-            network = util.get_network(network_id, user_id, non_deleted=True)
+            network = util.get_network(network_id, user_id, None,
+                                       non_deleted=True)
             return _create_port(user_id, network)
         else:
             raise ValueError("Unknown category: %s" % category)
 
 
-def create_public_ipv4_port(user_id, network=None, address=None,
+def create_public_ipv4_port(user_id, user_projects, network=None, address=None,
                             category="user"):
     """Create a port in a public IPv4 network.
 
@@ -680,7 +774,8 @@ def create_public_ipv4_port(user_id, network=None, address=None,
         if address is None:
             ipaddress = ips.get_free_floating_ip(user_id, network)
         else:
-            ipaddress = util.get_floating_ip_by_address(user_id, address,
+            ipaddress = util.get_floating_ip_by_address(user_id, user_projects,
+                                                        address,
                                                         for_update=True)
     elif category == "admin":
         if network is None:
@@ -707,7 +802,7 @@ def create_public_ipv6_port(user_id, category=None):
         raise faults.Conflict(msg)
 
 
-def create_ports_for_request(user_id, networks):
+def create_ports_for_request(user_id, user_projects, networks):
     """Create the server ports requested by the user.
 
     Create the ports for the new servers as requested in the 'networks'
@@ -722,28 +817,32 @@ def create_ports_for_request(user_id, networks):
     """
     if not isinstance(networks, list):
         raise faults.BadRequest("Malformed request. Invalid 'networks' field")
-    return [_port_for_request(user_id, network) for network in networks]
+    return [_port_for_request(user_id, user_projects, network)
+            for network in networks]
 
 
-def _port_for_request(user_id, network_dict):
+def _port_for_request(user_id, user_projects, network_dict):
     if not isinstance(network_dict, dict):
         raise faults.BadRequest("Malformed request. Invalid 'networks' field")
     port_id = network_dict.get("port")
     network_id = network_dict.get("uuid")
     if port_id is not None:
-        return util.get_port(port_id, user_id, for_update=True)
+        return util.get_port(port_id, user_id, user_projects, for_update=True)
     elif network_id is not None:
         address = network_dict.get("fixed_ip")
-        network = util.get_network(network_id, user_id, non_deleted=True)
+        network = util.get_network(network_id, user_id, user_projects,
+                                   non_deleted=True)
         if network.public:
             if network.subnet4 is not None:
                 if "fixed_ip" not in network_dict:
-                    return create_public_ipv4_port(user_id, network)
+                    return create_public_ipv4_port(user_id, user_projects,
+                                                   network)
                 elif address is None:
                     msg = "Cannot connect to public network"
                     raise faults.BadRequest(msg % network.id)
                 else:
-                    return create_public_ipv4_port(user_id, network, address)
+                    return create_public_ipv4_port(user_id, user_projects,
+                                                   network, address)
             else:
                 raise faults.Forbidden("Cannot connect to IPv6 only public"
                                        " network '%s'" % network.id)

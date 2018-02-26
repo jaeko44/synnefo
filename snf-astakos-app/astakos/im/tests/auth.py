@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2017 GRNET S.A.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -262,7 +262,7 @@ class ShibbolethTests(TestCase):
         client.reset_tokens()
         self.assertRedirects(r, ui_url("signup?third_party_token=%s" % token))
 
-        form = r.context['login_form']
+        form = r.context['signup_form']
         signupdata = copy.copy(form.initial)
         signupdata['email'] = 'kpap@synnefo.org'
         signupdata['third_party_token'] = token
@@ -458,13 +458,13 @@ class TestLocal(TestCase):
 
         credentials = {'username': 'γιού τι έφ', 'password': 'password'}
         r = self.client.post(ui_url('local'), credentials, follow=True)
-        fields = r.context['login_form'].fields.keyOrder
+        fields = r.context['login_form'].fields
         self.assertFalse('recaptcha_challenge_field' in fields)
         r = self.client.post(ui_url('local'), credentials, follow=True)
-        fields = r.context['login_form'].fields.keyOrder
+        fields = r.context['login_form'].fields
         self.assertFalse('recaptcha_challenge_field' in fields)
         r = self.client.post(ui_url('local'), credentials, follow=True)
-        fields = r.context['login_form'].fields.keyOrder
+        fields = r.context['login_form'].fields
         self.assertTrue('recaptcha_challenge_field' in fields)
 
     def test_no_moderation(self):
@@ -738,8 +738,31 @@ class TestLocal(TestCase):
         fuser = fixed[0]
         self.assertEqual(fuser.email, fuser.username)
 
+    @im_settings(IM_MODULES=['shibboleth', 'local'])
+    def test_multiple_providers(self):
+        local_user = get_local_user('kpelelis@synnefo.org')
+        self.assertEqual(len(local_user.get_auth_providers()), 1)
+
+        # Make sure we can add third party providers
+        local_user.add_auth_provider('shibboleth', identifier='12345')
+        self.assertEqual(len(local_user.get_auth_providers()), 2)
+
+        # Make sure we are unable to add a second local provier
+        with self.assertRaises(Exception):
+            local_user.add_auth_provider('local')
+
 
 class UserActionsTests(TestCase):
+
+    def tearDown(self):
+        AstakosUser.objects.all().delete()
+        Group.objects.all().delete()
+
+    def user_login(self, username, password):
+        self.client.login(username=username, password=password)
+        r = self.client.get(ui_url('profile'), follow=True)
+        user = r.context['request'].user
+        self.assertTrue(user.is_authenticated())
 
     def test_email_validation(self):
         backend = activation_backends.get_backend()
@@ -759,18 +782,14 @@ class UserActionsTests(TestCase):
                                        initial_data=user_data)
         self.assertFalse(form.is_valid())
 
-    def test_email_change(self):
+    def test_request_change_email(self):
         # to test existing email validation
         get_local_user('existing@synnefo.org')
 
-        # local user
         user = get_local_user('kpap@synnefo.org')
 
         # login as kpap
-        self.client.login(username='kpap@synnefo.org', password='password')
-        r = self.client.get(ui_url('profile'), follow=True)
-        user = r.context['request'].user
-        self.assertTrue(user.is_authenticated())
+        self.user_login(username='kpap@synnefo.org', password='password')
 
         # change email is enabled
         r = self.client.get(ui_url('email_change'))
@@ -794,7 +813,6 @@ class UserActionsTests(TestCase):
         r = self.client.post(ui_url('email_change'), data, follow=True)
         self.assertRedirects(r, ui_url('profile'))
         self.assertContains(r, messages.EMAIL_CHANGE_REGISTERED)
-        change1 = EmailChange.objects.get()
 
         # user sees a warning
         r = self.client.get(ui_url('email_change'))
@@ -803,7 +821,7 @@ class UserActionsTests(TestCase):
         self.assertTrue(user.email_change_is_pending())
 
         # link was sent
-        self.assertEqual(len(get_mailbox('kpap@synnefo.org')), 0)
+        self.assertEqual(len(get_mailbox('kpap@synnefo.org')), 1)
         self.assertEqual(len(get_mailbox('kpap@gmail.com')), 1)
 
         # proper email change
@@ -811,8 +829,27 @@ class UserActionsTests(TestCase):
         r = self.client.post(ui_url('email_change'), data, follow=True)
         self.assertRedirects(r, ui_url('profile'))
         self.assertContains(r, messages.EMAIL_CHANGE_REGISTERED)
-        self.assertEqual(len(get_mailbox('kpap@synnefo.org')), 0)
+        self.assertEqual(len(get_mailbox('kpap@synnefo.org')), 2)
         self.assertEqual(len(get_mailbox('kpap@yahoo.com')), 1)
+
+    def test_change_email(self):
+        # to test existing email validation
+        get_local_user('existing@synnefo.org')
+
+        # local user
+        user = get_local_user('kpap@synnefo.org')
+
+        # login as kpap
+        self.user_login(username='kpap@synnefo.org', password='password')
+
+        # proper email change
+        data = {'new_email_address': 'kpap@gmail.com'}
+        r = self.client.post(ui_url('email_change'), data, follow=True)
+        change1 = EmailChange.objects.get()
+
+        # proper email change
+        data = {'new_email_address': 'kpap@yahoo.com'}
+        r = self.client.post(ui_url('email_change'), data, follow=True)
         change2 = EmailChange.objects.get()
 
         r = self.client.get(change1.get_url())
@@ -844,9 +881,6 @@ class UserActionsTests(TestCase):
                              follow=True)
         self.assertContains(r, "Please enter a correct username and password")
         self.assertEqual(user.emailchanges.count(), 0)
-
-        AstakosUser.objects.all().delete()
-        Group.objects.all().delete()
 
 
 TEST_TARGETED_ID1 = \
@@ -1082,7 +1116,7 @@ class TestAuthProvidersAPI(TestCase):
             module, identifier)._instance.info.get('age'), 27)
 
         module = 'local'
-        identifier = None
+        identifier = ''
         provider_params = {'auth_backend': 'ldap', 'info':
                           {'office': 'A1'}}
         provider = auth.get_provider(module, user, identifier,
@@ -1120,7 +1154,7 @@ class TestAuthProvidersAPI(TestCase):
         self.assertEqual(sorted(user.groups.values_list('name', flat=True)),
                          sorted([u'group1', u'group2', u'group-create']))
 
-        local = auth.get_provider('local', user)
+        local = auth.get_provider('local', user, identifier='')
         local.add_to_user()
         provider = user.get_auth_provider('shibboleth')
         self.assertEqual(provider.get_add_groups_policy, ['group1', 'group2'])
@@ -1227,7 +1261,7 @@ class TestAuthProvidersAPI(TestCase):
                                                'test@academia.test')
         provider.add_to_user()
         user.get_auth_provider('shibboleth', 'test@academia.test')
-        provider = auth_providers.get_provider('local', user)
+        provider = auth_providers.get_provider('local', user, identifier='')
         provider.add_to_user()
         user.get_auth_provider('local')
 

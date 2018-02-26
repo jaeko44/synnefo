@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2017 GRNET S.A.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -18,6 +18,7 @@ from factory.fuzzy import FuzzyChoice
 from synnefo.db import models
 from random import choice
 from string import letters, digits
+import json
 
 
 def prefix_seq(x):
@@ -53,6 +54,14 @@ class VolumeTypeFactory(factory.DjangoModelFactory):
     deleted = False
 
 
+class VolumeTypeSpecsFactory(factory.DjangoModelFactory):
+
+    FACTORY_FOR = models.VolumeTypeSpecs
+    key = factory.Sequence(prefix_seq('key'))
+    value = factory.Sequence(prefix_seq('value'))
+    volume_type = factory.SubFactory(VolumeTypeFactory)
+
+
 class FlavorFactory(factory.DjangoModelFactory):
     FACTORY_FOR = models.Flavor
 
@@ -61,6 +70,14 @@ class FlavorFactory(factory.DjangoModelFactory):
     disk = factory.Sequence(lambda n: n * 1, type=int)
     volume_type = factory.SubFactory(VolumeTypeFactory)
     deleted = False
+    public = True
+
+
+class FlavorAccessFactory(factory.DjangoModelFactory):
+    FACTORY_FOR = models.FlavorAccess
+
+    project = factory.Sequence(prefix_seq("project"))
+    flavor = factory.SubFactory(FlavorFactory)
 
 
 class BackendFactory(factory.DjangoModelFactory):
@@ -72,6 +89,7 @@ class BackendFactory(factory.DjangoModelFactory):
     password = factory.Sequence(prefix_seq('password'))
     drained = False
     offline = False
+    public = True
 
     mfree = 8192
     mtotal = 16384
@@ -101,7 +119,8 @@ class VirtualMachineFactory(factory.DjangoModelFactory):
     flavor = factory.SubFactory(FlavorFactory)
     deleted = False
     suspended = False
-    #operstate = factory.Sequence(round_seq_first(FACTORY_FOR.OPER_STATES))
+    key_names = []
+    # operstate = factory.Sequence(round_seq_first(FACTORY_FOR.OPER_STATES))
     operstate = "STARTED"
     project = factory.LazyAttribute(lambda a: a.userid)
 
@@ -294,3 +313,10 @@ class IPAddressLogFactory(factory.DjangoModelFactory):
     server_id = 1
     network_id = 1
     active = True
+
+
+class ProjectBackendFactory(factory.DjangoModelFactory):
+    FACTORY_FOR = models.ProjectBackend
+
+    project = factory.Sequence(prefix_seq("project"))
+    backend = factory.SubFactory(BackendFactory)

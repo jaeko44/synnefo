@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2016 GRNET S.A. and individual contributors
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -29,6 +29,7 @@ import os
 path = os.path.normpath(os.path.join(os.getcwd(), '..'))
 sys.path.append(path)
 
+import django
 os.environ['DJANGO_SETTINGS_MODULE'] = 'synnefo.settings'
 from django.conf import settings
 
@@ -49,7 +50,7 @@ except:
     from daemon import pidlockfile
 import setproctitle
 
-from synnefo.lib.amqp import AMQPClient
+from synnefo.lib.amqp import AMQPClient, AMQPConnectionError
 from synnefo.logic import callbacks
 from synnefo.logic import queues
 from synnefo.db.models import Backend, pooled_rapi_client
@@ -68,6 +69,9 @@ LOGGERS = [log, log_amqp, log_logic]
 # After this timeout the snf-dispatcher will reconnect to the AMQP broker.
 DISPATCHER_RECONNECT_TIMEOUT = 600
 
+# Seconds to wait before retrying, if the connection to the AMQP broker has
+# failed.
+DISPATCHER_FAILED_CONNECTION_WAIT = 10
 
 # Time out after S Seconds while waiting messages from Ganeti clusters to
 # arrive. Warning: During this period snf-dispatcher will not consume any other
@@ -81,6 +85,8 @@ CHECK_TOOL_ACK_TIMEOUT = 10
 # Time out after S seconds while waiting for the status report from
 # snf-dispatcher to arrive.
 CHECK_TOOL_REPORT_TIMEOUT = 30
+# Seconds that the request queue will exist while there are no consumers.
+REQUEST_QUEUE_TTL = 600
 
 
 def get_hostname():
@@ -111,15 +117,29 @@ class Dispatcher:
                                 " to a different host. Verify that"
                                 " snf-ganeti-eventd is running!!", timeout)
                     self.client.reconnect(timeout=1)
+            except AMQPConnectionError as e:
+                log.error("AMQP connection failed: %s" % e)
+                log.warning("Sleeping for %d seconds before retrying to "
+                            "connect to an AMQP broker" %
+                            DISPATCHER_FAILED_CONNECTION_WAIT)
+                time.sleep(DISPATCHER_FAILED_CONNECTION_WAIT)
             except select.error as e:
                 if e[0] != errno.EINTR:
                     log.exception("Caught unexpected exception: %s", e)
+                    log.warning("Sleeping for %d seconds before retrying to "
+                                "connect to an AMQP broker" %
+                                DISPATCHER_FAILED_CONNECTION_WAIT)
+                    time.sleep(DISPATCHER_FAILED_CONNECTION_WAIT)
                 else:
                     break
             except (SystemExit, KeyboardInterrupt):
                 break
             except Exception as e:
                 log.exception("Caught unexpected exception: %s", e)
+                log.warning("Sleeping for %d seconds before retrying to "
+                            "connect to an AMQP broker" %
+                            DISPATCHER_FAILED_CONNECTION_WAIT)
+                time.sleep(DISPATCHER_FAILED_CONNECTION_WAIT)
 
         log.info("Clean up AMQP connection before exit")
         self.client.basic_cancel(timeout=1)
@@ -180,7 +200,8 @@ class Dispatcher:
         # status check request
         hostname, pid = get_hostname(), os.getpid()
         queue = queues.get_dispatcher_request_queue(hostname, pid)
-        self.client.queue_declare(queue=queue, mirrored=True, ttl=60)
+        self.client.queue_declare(queue=queue, mirrored=True,
+                                  ttl=REQUEST_QUEUE_TTL)
         self.client.basic_consume(queue=queue, callback=handle_request)
         log.debug("Binding %s(%s) to queue %s with handler 'hadle_request'",
                   exchange, routing_key, queue)
@@ -461,21 +482,13 @@ def daemon_mode(opts):
 
 
 def setup_logging(opts):
-    import logging
-    formatter = logging.Formatter("%(asctime)s %(name)s %(module)s"
-                                  " [%(levelname)s] %(message)s")
-    if opts.debug or opts.status_check:
-        log_handler = logging.StreamHandler()
-        log_handler.setFormatter(formatter)
-    else:
-        import logging.handlers
-        log_file = "/var/log/synnefo/dispatcher.log"
-        log_handler = logging.handlers.WatchedFileHandler(log_file)
-        log_handler.setFormatter(formatter)
-
-    for l in LOGGERS:
-        l.addHandler(log_handler)
-        l.setLevel(logging.DEBUG)
+    try:
+        from logging.config import dictConfig
+        from synnefo.settings import DISPATCHER_LOGGING_SETUP
+        dictConfig(DISPATCHER_LOGGING_SETUP)
+    except ImportError:
+        sys.stderr.write("ERROR: Cannot import \'DISPATCHER_LOGGING_SETUP\'")
+        sys.exit(1)
 
 
 def main():
@@ -520,13 +533,19 @@ def main():
 
     files_preserve = []
     for handler in log.handlers:
-        stream = getattr(handler, 'stream')
+        try:
+            stream = getattr(handler, 'stream')
+        except AttributeError:
+            continue
         if stream and hasattr(stream, 'fileno'):
             files_preserve.append(handler.stream)
 
     stderr_stream = None
     for handler in log.handlers:
-        stream = getattr(handler, 'stream')
+        try:
+            stream = getattr(handler, 'stream')
+        except AttributeError:
+            continue
         if stream and hasattr(handler, 'baseFilename'):
             stderr_stream = stream
             break
@@ -553,6 +572,8 @@ def main():
         log.debug("gevent imported. Reinitializing gevent")
         import gevent
         gevent.reinit()
+
+    django.setup()
 
     # Catch every exception, make sure it gets logged properly
     try:

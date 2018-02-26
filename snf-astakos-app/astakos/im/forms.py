@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2017 GRNET S.A.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -15,8 +15,8 @@
 import re
 import synnefo.util.date as date_util
 
-from random import random
 from datetime import datetime
+from collections import OrderedDict
 
 from django import forms
 from django.utils.translation import ugettext as _
@@ -26,7 +26,6 @@ from django.core.mail import send_mail, get_connection
 from django.contrib.auth.tokens import default_token_generator
 from django.core.urlresolvers import reverse
 from django.utils.safestring import mark_safe
-from django.utils.encoding import smart_str
 from astakos.im import transaction
 from django.core import validators
 
@@ -40,7 +39,7 @@ from astakos.im import presentation
 from astakos.im.widgets import DummyWidget, RecaptchaWidget
 from astakos.im.functions import submit_application, \
     accept_membership_project_checks, ProjectError
-from astakos.im.user_utils import send_change_email
+from astakos.im.user_utils import change_user_email
 
 from astakos.im.util import reserved_verified_email, model_to_dict
 from astakos.im import auth_providers
@@ -51,7 +50,6 @@ from astakos.im.auth_backends import LDAPBackend
 import astakos.im.messages as astakos_messages
 
 import logging
-import hashlib
 import recaptcha.client.captcha as captcha
 import re
 
@@ -104,14 +102,20 @@ class LocalUserCreationForm(UserCreationForm):
                                                         None))
 
         super(LocalUserCreationForm, self).__init__(*args, **kwargs)
-        self.fields.keyOrder = ['email', 'first_name', 'last_name',
-                                'password1', 'password2']
+
+        self.fields_list = ['email', 'first_name', 'last_name', 'password1',
+                            'password2']
 
         if settings.RECAPTCHA_ENABLED:
-            self.fields.keyOrder.extend(['recaptcha_challenge_field',
-                                         'recaptcha_response_field', ])
+            self.fields_list.extend(['recaptcha_challenge_field',
+                                     'recaptcha_response_field', ])
+
         if get_latest_terms():
-            self.fields.keyOrder.append('has_signed_terms')
+            self.fields_list.extend(['has_signed_terms',])
+
+
+        ofields = self.fields
+        self.fields = OrderedDict((n, ofields[n]) for n in self.fields_list)
 
         if 'has_signed_terms' in self.fields:
             # Overriding field label since we need to apply a link
@@ -291,10 +295,13 @@ class LoginForm(AuthenticationForm):
                 kwargs.pop(elem)
         super(LoginForm, self).__init__(*args, **kwargs)
 
-        self.fields.keyOrder = ['username', 'password']
+        self.fields_list = ['username', 'password']
         if was_limited and settings.RECAPTCHA_ENABLED:
-            self.fields.keyOrder.extend(['recaptcha_challenge_field',
-                                         'recaptcha_response_field', ])
+            self.fields_list.extend(['recaptcha_challenge_field',
+                                     'recaptcha_response_field', ])
+
+        ofields = self.fields
+        self.fields = OrderedDict((n, ofields[n]) for n in self.fields_list)
 
     def clean_username(self):
         return self.cleaned_data['username'].lower()
@@ -385,7 +392,6 @@ class LDAPLoginForm(LoginForm):
                         raise
                 raise forms.ValidationError(
                     self.error_messages['invalid_login'])
-        self.check_for_test_cookie()
         return self.cleaned_data
 
     def get_ldap_user_id(self):
@@ -551,20 +557,8 @@ class EmailChangeForm(forms.ModelForm):
             raise forms.ValidationError(_(astakos_messages.EMAIL_USED))
         return addr
 
-    def save(self, request,
-             email_template_name='registration/email_change_email.txt',
-             commit=True, **kwargs):
-        ec = super(EmailChangeForm, self).save(commit=False, **kwargs)
-        ec.user = request.user
-        # delete pending email changes
-        request.user.emailchanges.all().delete()
-
-        activation_key = hashlib.sha1(
-            str(random()) + smart_str(ec.new_email_address))
-        ec.activation_key = activation_key.hexdigest()
-        if commit:
-            ec.save(**kwargs)
-        send_change_email(ec, request, email_template_name=email_template_name)
+    def save(self):
+        raise NotImplementedError
 
 
 class SignApprovalTermsForm(forms.ModelForm):
@@ -666,7 +660,12 @@ class ExtendedSetPasswordForm(SetPasswordForm):
 
             provider = auth_providers.get_provider('local', self.user)
             if provider.get_add_policy:
-                provider.add_to_user()
+                try:
+                    local_provider = provider.get_user_module_providers()[0]
+                    local_provider.active = True
+                    local_provider.save()
+                except IndexError:
+                    provider.add_to_user()
 
         except BaseException, e:
             logger.exception(e)
@@ -859,7 +858,17 @@ class ProjectApplicationForm(forms.ModelForm):
 
     def clean(self):
         userid = self.data.get('user', None)
-        policies = self.resource_policies
+        try:
+            policies = self.resource_policies
+        except forms.ValidationError, e:
+            if e.params and 'key' in e.params:
+                msg = e.message or e.messages
+                if e.messages and len(e.messages):
+                    msg = e.messages[0]
+                self._errors['resources'] = {e.params['key']: msg}
+                raise forms.ValidationError(_(astakos_messages.INVALID_RESOURCE_DATA))
+            raise e
+
         self.user = None
         if userid:
             try:
@@ -870,6 +879,11 @@ class ProjectApplicationForm(forms.ModelForm):
             raise forms.ValidationError(_(astakos_messages.NO_APPLICANT))
         cleaned_data = super(ProjectApplicationForm, self).clean()
         return cleaned_data
+
+    def value_or_inf(self, value):
+        if value == 'inf' or value == 'Unlimited':
+            return units.PRACTICALLY_INFINITE
+        return value
 
     @property
     def resource_policies(self):
@@ -921,8 +935,7 @@ class ProjectApplicationForm(forms.ModelForm):
             if name.endswith('_uplimit'):
                 is_project_limit = name.endswith('_p_uplimit')
                 suffix = '_p_uplimit' if is_project_limit else '_m_uplimit'
-                if value == 'inf' or value == 'Unlimited':
-                    value = units.PRACTICALLY_INFINITE
+                value = self.value_or_inf(value)
                 uplimit = value
                 prefix, _suffix = name.split(suffix)
 
@@ -933,23 +946,27 @@ class ProjectApplicationForm(forms.ModelForm):
                                                 resource.name)
 
                 if is_project_limit:
-                    member_limit = data.get(prefix + '_m_uplimit')
+                    _key = prefix + '_m_uplimit'
+                    member_limit = self.value_or_inf(data.get(_key))
                     try:
                         pvalue = int(value)
                         mvalue = int(member_limit)
                     except:
-                        raise forms.ValidationError("Invalid format")
+                        raise forms.ValidationError("Invalid format", params=dict(key=_key))
                 else:
-                    project_limit = data.get(prefix + '_p_uplimit')
+                    _key = prefix + '_p_uplimit'
+                    project_limit = self.value_or_inf(data.get(_key))
                     try:
                         mvalue = int(value)
+                        if not project_limit:
+                            raise forms.ValidationError("Total limit is required", params=dict(key=_key))
                         pvalue = int(project_limit)
-                    except:
-                        raise forms.ValidationError("Invalid format")
+                    except ValueError:
+                        raise forms.ValidationError("Invalid format", params=dict(key=_key))
 
                 if mvalue > pvalue:
-                    msg = "%s per member limit exceeds total limit"
-                    raise forms.ValidationError(msg % resource.name)
+                    msg = "Per member limit exceeds total limit"
+                    raise forms.ValidationError(msg, params=dict(key=_key))
 
                 # keep only resource limits for selected resource groups
                 if data.get('is_selected_%s' % \
@@ -1086,7 +1103,7 @@ class ProjectApplicationForm(forms.ModelForm):
         user_uuid = self.user.uuid if is_new else owner_uuid
         try:
             object_owner = AstakosUser.objects.get(uuid=user_uuid)
-            data['owner'] = object_owner
+            data['owner'] = object_owner.uuid
         except AstakosUser.DoesNotExist:
             pass
 
@@ -1116,14 +1133,23 @@ class ProjectApplicationForm(forms.ModelForm):
             data['end_date'] = date_util.isoformat(data.get('end_date'))
 
         limit = data.get('limit_on_members_number', None)
-        if limit:
-            data['max_members'] = data.get('limit_on_members_number')
-        else:
-            data['max_members'] = units.PRACTICALLY_INFINITE
+        if is_new or instance.limit_on_members_number != limit:
+            if limit:
+                data['max_members'] = data.get('limit_on_members_number')
+            else:
+                data['max_members'] = units.PRACTICALLY_INFINITE
 
         data['request_user'] = self.user
-        if 'owner' in data:
-            data['owner'] = data['owner'].uuid
+        owner = data.get('owner', None)
+
+        if not is_new and instance.owner.uuid == owner:
+            del data['owner']
+
+        from astakos.api.projects import MEMBERSHIP_POLICY_SHOW as POLICIES
+        for _key in ['join_policy', 'leave_policy']:
+            _mkey = 'member_%s' % _key
+            if _mkey in data:
+                data[_key] = POLICIES.get(int(data[_mkey]), None)
 
         return data
 
@@ -1201,7 +1227,10 @@ class AddProjectMembersForm(forms.Form):
         q = self.cleaned_data.get('q') or ''
         users = re.split("\r\n|\n|,", q)
         users = list(u.strip() for u in users if u)
-        db_entries = AstakosUser.objects.accepted().filter(email__in=users)
+
+        # Notice that deactivated users are reported as 'unknown' here, too.
+        db_entries = AstakosUser.objects.accepted().filter(
+            email__in=users, is_active=True)
         unknown = list(set(users) - set(u.email for u in db_entries))
         if unknown:
             raise forms.ValidationError(
@@ -1284,12 +1313,13 @@ class ExtendedProfileForm(ProfileForm):
         else:
             self.fields_list.remove('new_email_address')
             self.fields_list.remove('change_email')
-            del self.fields['change_email']
 
         self._init_extra_forms()
         self.save_extra_forms = []
         self.success_messages = []
-        self.fields.keyOrder = self.fields_list
+
+        ofields = self.fields
+        self.fields = OrderedDict((n, ofields[n]) for n in self.fields_list)
 
     def _init_extra_form_fields(self):
         if self.email_change:
@@ -1344,7 +1374,10 @@ class ExtendedProfileForm(ProfileForm):
 
     def save(self, request, *args, **kwargs):
         if 'email' in self.save_extra_forms:
-            self.email_change_form.save(request, *args, **kwargs)
+            change_user_email(
+                self.instance,
+                self.email_change_form.cleaned_data['new_email_address']
+            )
             self.email_changed = True
         if 'password' in self.save_extra_forms:
             self.password_change_form.save(*args, **kwargs)

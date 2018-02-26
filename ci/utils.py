@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Copyright (C) 2010-2015 GRNET S.A.
+# Copyright (C) 2010-2016 GRNET S.A.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -26,9 +26,10 @@ import time
 import httplib
 import logging
 import fabric.api as fabric
-import simplejson as json
+import json
 import subprocess
 import tempfile
+import urlparse
 from ConfigParser import ConfigParser, DuplicateSectionError
 
 from kamaki.cli import config as kamaki_config
@@ -40,11 +41,13 @@ from kamaki.clients.utils import https
 from kamaki.clients import ClientError
 import filelocker
 
-DEFAULT_CONFIG_FILE = "ci_wheezy.conf"
+DEFAULT_CONFIG_FILE = "ci_jessie.conf"
 # Is our terminal a colorful one?
 USE_COLORS = True
 # Ignore SSL verification
 IGNORE_SSL = False
+# Ignore running SSH agents
+SSH_NO_AGENT = False
 # UUID of owner of system images
 DEFAULT_SYSTEM_IMAGES_UUID = [
     "25ecced9-bf53-4145-91ee-cf47377e9fb2",  # production (okeanos.grnet.gr)
@@ -57,7 +60,7 @@ work_dir = "/var/tmp"
 
 def _run(cmd, verbose):
     """Run fabric with verbose level"""
-    if verbose:
+    if verbose or os.environ.get('CI_VERBOSE', None):
         args = ('running',)
     else:
         args = ('running', 'stdout',)
@@ -233,11 +236,11 @@ class SynnefoCI(object):
 
         config = kamaki_config.Config()
         if self.kamaki_cloud is None:
-            try:
-                self.kamaki_cloud = config.get("global", "default_cloud")
-            except AttributeError:
-                # Compatibility with kamaki version <=0.10
-                self.kamaki_cloud = config.get("global", "default_cloud")
+            self.kamaki_cloud = config.get("global", "default_cloud")
+
+        if not self.kamaki_cloud:
+            raise Exception("Unable to find 'default_cloud' in %s" %
+                            config.path)
 
         self.logger.info("Setup kamaki client, using cloud '%s'.." %
                          self.kamaki_cloud)
@@ -470,10 +473,20 @@ class SynnefoCI(object):
         echo 'precedence ::ffff:0:0/96  100' >> /etc/gai.conf
         apt-get update
         apt-get install -q=2 curl --yes --force-yes
-        echo -e "{0}" >> /etc/apt/sources.list.d/synnefo.wheezy.list
+        echo -e "{0}" >> /etc/apt/sources.list.d/synnefo.jessie.list
         # Synnefo repo's key
         curl https://dev.grnet.gr/files/apt-grnetdev.pub | apt-key add -
         """.format(self.config.get('Global', 'apt_repo'))
+        _run(cmd, False)
+
+        cmd = """
+        apt-get install -q=2 --force-yes apt-transport-https
+        curl -s https://deb.nodesource.com/gpgkey/nodesource.gpg.key | apt-key add -
+        echo 'deb https://deb.nodesource.com/node_0.12 jessie main' >> /etc/apt/sources.list.d/nodejs.list
+        echo 'deb-src https://deb.nodesource.com/node_0.12 jessie main' >> /etc/apt/sources.list.d/nodejs.list
+        apt-get update
+        apt-get install -q=2 --force-yes nodejs python-libsass
+        """
         _run(cmd, False)
 
         cmd = """
@@ -482,7 +495,7 @@ class SynnefoCI(object):
         apt-get install x2go-keyring --yes --force-yes
         apt-get update
         apt-get install x2goserver x2goserver-xsession \
-                iceweasel --yes --force-yes
+                firefox-esr --yes --force-yes
 
         # xterm published application
         echo '[Desktop Entry]' > /usr/share/applications/xterm.desktop
@@ -742,6 +755,11 @@ class SynnefoCI(object):
         # Read specified option
         return self.temp_config.get(str(self.build_id), option)
 
+    def get_config(self, section, option, default, access='get'):
+        if not self.config.has_option(section, option):
+            return default
+        return getattr(self.config, "get%s" % access)(section, option)
+
     def setup_fabric(self):
         """Setup fabric environment"""
         self.logger.info("Setup fabric parameters..")
@@ -753,6 +771,14 @@ class SynnefoCI(object):
         fabric.env.shell = "/bin/bash -c"
         fabric.env.disable_known_hosts = True
         fabric.env.output_prefix = None
+
+        no_agent = SSH_NO_AGENT or self.get_config(
+            'Global', 'no_agent', False, 'boolean')
+        fabric.env.no_agent = no_agent
+
+        forward_agent = self.get_config(
+            'Global', 'forward_agent', False, 'boolean')
+        fabric.env.forward_agent = forward_agent
 
     def _check_hash_sum(self, localfile, remotefile):
         """Check hash sums of two files"""
@@ -767,12 +793,23 @@ class SynnefoCI(object):
             self.logger.error("Hashes differ.. aborting")
             sys.exit(1)
 
+    def _prepare_known_hosts(self, repo):
+        parsed = urlparse.urlparse(repo)
+        if parsed.scheme != "ssh":
+            return
+
+        hostname = parsed.hostname
+        self.logger.info("Prepare ~/.ssh/known_hosts for %r" % hostname)
+        cmd = """ssh-keyscan %s >> ~/.ssh/known_hosts""" % hostname
+        _run(cmd, False)
+
     @_check_fabric
     def clone_repo(self, synnefo_repo=None, synnefo_branch=None,
                    local_repo=False, pull_request=None):
         """Clone Synnefo repo from slave server"""
         self.logger.info("Configure repositories on remote server..")
         self.logger.debug("Install/Setup git")
+
         cmd = """
         apt-get install git --yes --force-yes
         git config --global user.name {0}
@@ -785,10 +822,10 @@ class SynnefoCI(object):
         synnefo_branch = self.clone_synnefo_repo(
             synnefo_repo=synnefo_repo, synnefo_branch=synnefo_branch,
             local_repo=local_repo, pull_request=pull_request)
-        # Clone pithos-web-client
-        if self.config.get("Global", "build_pithos_webclient") == "True":
-            # Clone pithos-web-client
-            self.clone_pithos_webclient_repo(synnefo_branch)
+        # Clone snf-ui-app
+        if self.config.get("Global", "build_ui") == "True":
+            # Clone snf-ui-app
+            self.clone_ui_repo(synnefo_branch)
 
     @_check_fabric
     def clone_synnefo_repo(self, synnefo_repo=None, synnefo_branch=None,
@@ -915,61 +952,61 @@ class SynnefoCI(object):
         return synnefo_branch
 
     @_check_fabric
-    def clone_pithos_webclient_repo(self, synnefo_branch):
-        """Clone Pithos WebClient repo to remote server"""
-        # Find pithos_webclient_repo and pithos_webclient_branch to use
-        pithos_webclient_repo = \
-            self.config.get('Global', 'pithos_webclient_repo')
-        pithos_webclient_branch = \
-            self.config.get('Global', 'pithos_webclient_branch')
+    def clone_ui_repo(self, synnefo_branch):
+        """Clone ui repo to remote server"""
+        # Find ui_repo and ui_branch to use
+        ui_repo = \
+            self.config.get('Global', 'ui_repo')
+        ui_branch = \
+            self.config.get('Global', 'ui_branch')
 
-        # Clone pithos-webclient from remote repo
-        self.logger.debug("Clone pithos-webclient from %s" %
-                          pithos_webclient_repo)
-        self._git_clone(pithos_webclient_repo, directory="%s/pithos-web-client"
+        # Clone snf-ui-app from remote repo
+        self.logger.debug("Clone snf-ui-app from %s" %
+                          ui_repo)
+        self._git_clone(ui_repo, directory="%s/snf-ui-app"
                         % work_dir)
 
-        # Track all pithos-webclient branches
+        # Track all snf-ui-app branches
         cmd = """
-        cd %s/pithos-web-client
+        cd %s/snf-ui-app
         for branch in `git branch -a | grep remotes | grep -v HEAD`; do
             git branch --track ${branch##*/} $branch > /dev/null 2>&1
         done
         git --no-pager branch --no-color
         """ % work_dir
-        webclient_branches = _run(cmd, False)
-        webclient_branches = webclient_branches.split()
+        ui_branches = _run(cmd, False)
+        ui_branches = ui_branches.split()
 
-        # If we have pithos_webclient_branch in config file use this one
+        # If we have ui_branch in config file use this one
         # else try to use the same branch as synnefo_branch
         # else use an appropriate one.
-        if pithos_webclient_branch == "":
-            if synnefo_branch in webclient_branches:
-                pithos_webclient_branch = synnefo_branch
+        if ui_branch == "":
+            if synnefo_branch in ui_branches:
+                ui_branch = synnefo_branch
             else:
                 # If synnefo_branch starts with one of
                 # 'master', 'hotfix'; use the master branch
                 if synnefo_branch.startswith('master') or \
                         synnefo_branch.startswith('hotfix'):
-                    pithos_webclient_branch = "master"
+                    ui_branch = "master"
                 # If synnefo_branch starts with one of
                 # 'develop', 'feature'; use the develop branch
                 elif synnefo_branch.startswith('develop') or \
                         synnefo_branch.startswith('feature'):
-                    pithos_webclient_branch = "develop"
+                    ui_branch = "develop"
                 else:
                     self.logger.warning(
-                        "Cannot determine which pithos-web-client branch to "
+                        "Cannot determine which snf-ui-app branch to "
                         "use based on \"%s\" synnefo branch. "
                         "Will use develop." % synnefo_branch)
-                    pithos_webclient_branch = "develop"
+                    ui_branch = "develop"
         # Checkout branch
         self.logger.debug("Checkout \"%s\" branch" %
-                          _green(pithos_webclient_branch))
+                          _green(ui_branch))
         cmd = """
-        cd {0}/pithos-web-client
+        cd {0}/snf-ui-app
         git checkout {1}
-        """.format(work_dir, pithos_webclient_branch)
+        """.format(work_dir, ui_branch)
         _run(cmd, False)
 
     def _git_clone(self, repo, directory=""):
@@ -979,6 +1016,9 @@ class SynnefoCI(object):
         So retry!!
 
         """
+        if repo and "ssh" in repo:
+            self._prepare_known_hosts(repo)
+
         cloned = False
         for i in range(1, 11):
             try:
@@ -998,7 +1038,7 @@ class SynnefoCI(object):
         cmd = """
         apt-get update
         apt-get install zlib1g-dev dpkg-dev debhelper git-buildpackage \
-                python-dev python-all python-pip ant --yes --force-yes
+                python-dev python-all python-pip dh-systemd --yes --force-yes
         pip install -U devflow
         """
         _run(cmd, False)
@@ -1014,9 +1054,9 @@ class SynnefoCI(object):
 
         # Build synnefo packages
         self.build_synnefo()
-        # Build pithos-web-client packages
-        if self.config.get("Global", "build_pithos_webclient") == "True":
-            self.build_pithos_webclient()
+        # Build snf-ui-app packages
+        if self.config.get("Global", "build_ui") == "True":
+            self.build_ui()
 
     @_check_fabric
     def build_synnefo(self):
@@ -1048,20 +1088,20 @@ class SynnefoCI(object):
         _run(cmd, False)
 
     @_check_fabric
-    def build_pithos_webclient(self):
-        """Build pithos-web-client packages"""
-        self.logger.info("Build pithos-web-client packages..")
+    def build_ui(self):
+        """Build snf-ui-app packages"""
+        self.logger.info("Build snf-ui-app packages..")
 
         cmd = """
-        devflow-autopkg snapshot -b %s/webclient_build-area --no-sign
+        devflow-autopkg snapshot -b %s/ui_build-area --no-sign
         """ % work_dir
-        with fabric.cd("%s/pithos-web-client" % work_dir):
+        with fabric.cd("%s/snf-ui-app" % work_dir):
             _run(cmd, True)
 
-        # Setup pithos-web-client packages for snf-deploy
-        self.logger.debug("Copy webclient debs to snf-deploy packages dir")
+        # Setup snf-ui-app packages for snf-deploy
+        self.logger.debug("Copy snf-ui-app debs to snf-deploy packages dir")
         cmd = """
-        cp %s/webclient_build-area/*.deb /var/lib/snf-deploy/packages/
+        cp %s/ui_build-area/*.deb /var/lib/snf-deploy/packages/
         """ % work_dir
         _run(cmd, False)
 
@@ -1088,7 +1128,7 @@ class SynnefoCI(object):
                          _green(dest))
 
     @_check_fabric
-    def deploy_synnefo(self, schema=None):
+    def deploy_synnefo(self, schema=None, local_package_dir=None):
         """Deploy Synnefo using snf-deploy"""
         self.logger.info("Deploy Synnefo..")
         if schema is None:
@@ -1107,11 +1147,35 @@ class SynnefoCI(object):
         """.format(work_dir, schema)
         _run(cmd, False)
 
+        if local_package_dir is None:
+            local_package_dir = self.config.get("Deployment",
+                                                "local_package_dir")
+
+        if local_package_dir:
+            self.logger.debug("Upload local package directory to the "
+                              "snf-deploy package dir.")
+            _put(local_package_dir + "/*", "/var/lib/snf-deploy/packages")
+
         self.logger.debug("Change password in nodes.conf file")
         cmd = """
         sed -i 's/^password =.*/password = {0}/' /etc/snf-deploy/nodes.conf
         """.format(fabric.env.password)
         _run(cmd, False)
+
+        wildcard_dns = self.get_config(
+                'Deployment', 'wildcard_dns', False, '').strip()
+        if wildcard_dns:
+            address = self.temp_config.get(str(self.build_id), 'server_ip')
+            domain = "{0}.{1}".format(address, wildcard_dns)
+            self.logger.debug("Setting domain to {0}".format(domain))
+            cmd = """
+            sed -i 's/^domain.*=.*/domain = {0}/' /etc/snf-deploy/nodes.conf
+            """.format(domain)
+            _run(cmd, False)
+            cmd = """
+            sed -i 's/^domain.*=.*/domain = {0}/' /etc/snf-deploy/ganeti.conf
+            """.format(domain)
+            _run(cmd, False)
 
         self.logger.debug("Run snf-deploy")
         cmd = """
@@ -1127,7 +1191,12 @@ class SynnefoCI(object):
 
         self.logger.debug("Install needed packages")
         cmd = """
-        pip install -U funcsigs mock==1.1.2 factory_boy==2.4.1 nose coverage
+        pip install -U pip setuptools
+        """
+        _run(cmd, False)
+
+        cmd = """
+        pip install -U mock factory_boy==2.4.1 django-nose==1.4.3 coverage
         """
         _run(cmd, False)
 
@@ -1192,8 +1261,8 @@ class SynnefoCI(object):
         if not os.path.exists(dest):
             os.makedirs(dest)
         self.fetch_compressed("%s/synnefo_build-area" % work_dir, dest)
-        if self.config.get("Global", "build_pithos_webclient") == "True":
-            self.fetch_compressed("%s/webclient_build-area" % work_dir, dest)
+        if self.config.get("Global", "build_ui") == "True":
+            self.fetch_compressed("%s/ui_build-area" % work_dir, dest)
         self.logger.info("Downloaded debian packages to %s" %
                          _green(dest))
 

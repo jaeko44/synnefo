@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2016 GRNET S.A.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -22,11 +22,12 @@ from snf_django.management.utils import parse_bool
 from snf_django.management.commands import SynnefoCommand
 
 from synnefo.logic import servers
+from synnefo.db import transaction
 
 HELP_MSG = """
 
 Create a new VM without authenticating the user or checking the resource
-limits of the user. Also the allocator can be bypassed by specifing a
+limits of the user. Also the allocator can be bypassed by specifying a
 backend-id.
 """
 
@@ -44,6 +45,8 @@ class Command(SynnefoCommand):
                     help="An arbitrary string for naming the server"),
         make_option("--user", dest="user_id",
                     help="Unique identifier of the owner of the server"),
+        make_option("--project", dest="project",
+                    help="Unique identifier of the project of the server"),
         make_option("--image", dest="image_id", default=None,
                     help="Unique identifier of the image."
                          " Use snf-manage image-list to find out"
@@ -65,6 +68,10 @@ class Command(SynnefoCommand):
                     default=[]),
         make_option("--floating-ips", dest="floating_ip_ids",
                     help="Comma separated list of port IDs to connect"),
+        make_option("--helper", action="store_true", dest="helper_vm",
+                    help="Defines that the server will be used for internal"
+                         " Synnefo actions.",
+                    default=False),
         make_option(
             '--wait',
             dest='wait',
@@ -75,6 +82,7 @@ class Command(SynnefoCommand):
 
     )
 
+    @transaction.commit_on_success
     @common.convert_api_faults
     def handle(self, *args, **options):
         if args:
@@ -82,16 +90,20 @@ class Command(SynnefoCommand):
 
         name = options['name']
         user_id = options['user_id']
+        project = options['project']
         backend_id = options['backend_id']
         image_id = options['image_id']
         flavor_id = options['flavor_id']
         password = options['password']
         volumes = options['volumes']
+        helper_vm = options['helper_vm']
 
         if not name:
             raise CommandError("name is mandatory")
         if not user_id:
             raise CommandError("user is mandatory")
+        if not project:
+            project = user_id
         if not password:
             raise CommandError("password is mandatory")
         if not flavor_id:
@@ -113,7 +125,8 @@ class Command(SynnefoCommand):
         server = servers.create(user_id, name, password, flavor, image_id,
                                 networks=connection_list,
                                 volumes=volumes_list,
-                                use_backend=backend)
+                                use_backend=backend, helper=helper_vm,
+                                project=project)
         pprint.pprint_server(server, stdout=self.stdout)
 
         wait = parse_bool(options["wait"])

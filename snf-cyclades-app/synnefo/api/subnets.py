@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2016 GRNET S.A. and individual contributors
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -18,7 +18,7 @@ from snf_django.lib import api
 
 from django.conf.urls import patterns
 from django.http import HttpResponse
-from django.utils import simplejson as json
+import json
 from django.db.models import Q
 
 from snf_django.lib.api import utils
@@ -64,12 +64,12 @@ def subnet_demux(request, sub_id):
 @api.api_method(http_method='GET', user_required=True, logger=log)
 def list_subnets(request, detail=True):
     """List all subnets of a user"""
-    userid = request.user_uniq
-    subnets_list = Subnet.objects.filter(Q(public=True) |
-                                         (Q(userid=userid) &
-                                          Q(public=False)))\
-                                 .order_by("id")
+
+    subnets_list = Subnet.objects.for_user(request.user_uniq,
+                                           request.user_projects,
+                                           public=True).order_by('id')
     subnets_list = subnets_list.prefetch_related("ip_pools")
+
     subnets_list = api.utils.filter_modified_since(request,
                                                    objects=subnets_list)
 
@@ -150,7 +150,7 @@ def create_subnet(request):
 def get_subnet(request, sub_id):
     """Show info of a specific subnet"""
     user_id = request.user_uniq
-    subnet = subnets.get_subnet(sub_id, user_id)
+    subnet = subnets.get_subnet(sub_id, user_id, request.user_projects)
 
     subnet_dict = subnet_to_dict(subnet)
     data = json.dumps({'subnet': subnet_dict})

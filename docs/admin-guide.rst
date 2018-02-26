@@ -430,6 +430,22 @@ add up quota from different projects. Note also that if allocating an entity
 requires multiple resources (e.g. cpu and ram for a Cyclades VM) these must
 be all assigned to a single project.
 
+Reclaiming resources
+````````````````````
+
+When a project is deactivated or a user is removed from a project, the quota
+that have been granted to the user are revoked. If the user still owns
+resources assigned to the project, the user quota appear overlimit on that
+project. The services are responsible to inspect the overquota state of
+users and reclaim their resources. For instance, cyclades provides
+the management command ``enforce-resources-cyclades`` to reclaim VMs,
+volumes, and floating IPs.
+
+When a user is deactivated, their system project, owned projects and project
+memberships are suspended. Subsequently, the user's resources can be
+reclaimed as explained above.
+
+
 Control projects
 ````````````````
 
@@ -550,7 +566,7 @@ X-Auth-Token
 Alice requests a specific resource from a cloud service e.g.: Pithos. In the
 request she supplies the `X-Auth-Token` to identify whether she is eligible to
 perform the specific task. The service contacts Astakos through its
-``/account/v1.0/authenticate`` api call (see :ref:`authenticate-api-label`)
+``/account/v1.0/authenticate`` api call
 providing the specific ``X-Auth-Token``. Astakos checkes whether the token
 belongs to an active user and it has not expired and returns a dictionary
 containing user related information. Finally the service uses the ``uniq``
@@ -605,11 +621,11 @@ user information by the cookie identified by ``ASTAKOS_COOKIE_NAME`` setting
 (set during the login procedure).
 
 Finally, backend systems having acquired a token can use the
-:ref:`authenticate-api-label` API call from a private network or through HTTPS.
+'authenticate-api-label' API call from a private network or through HTTPS.
 
 
 File/Object Storage Service (Pithos+)
-====================================
+=====================================
 
 Pithos+ is the Synnefo component that implements a storage service and exposes
 the associated OpenStack REST APIs with custom extensions.
@@ -644,7 +660,7 @@ Enabling this feature consists of the following steps:
 
            AllowEncodedSlashes On
 
-           RequestHeader set X-Forwarded-Protocol "https"
+           RequestHeader set X-Forwarded-Proto "https"
 
         <Proxy * >
             Order allow,deny
@@ -804,13 +820,18 @@ Currently the available disk templates are the following:
   - `ext_archipelago`: External shared storage provided by
     `Archipelago <http://www.synnefo.org/docs/archipelago/latest/index.html>`_.
 
+In addition, volume types contain a list of key value pair specs. The specs
+which their keys are prefixed with `GNT-EXTP:` are propagated to Ganeti
+ext-storage scripts in case the disk template is `ext`.
+
 Volume types are created by the administrator using the `snf-manage
-volume-type-create` command and providing the `disk template` and a
-human-friendly name:
+volume-type-create` command and providing the `disk template`, a
+human-friendly name as well as some optional key-value specs.:
 
 .. code-block:: console
 
  $ snf-manage volume-type-create --disk-template=drbd --name=DRBD
+ $ snf-manage volume-type-create --disk-template=ext_rbd --name=RBD --specs GNT-EXTP:RBD_POOL=poola
 
 Flavors are created by the administrator using `snf-manage flavor-create`
 command. The command takes as argument number of CPUs, amount of RAM, the size
@@ -985,9 +1006,10 @@ can be dynamically added or removed via `snf-manage` commands.
 Each newly created VM is allocated to a Ganeti backend by the Cyclades backend
 allocator. The VM is "pinned" to this backend, and can not change through its
 lifetime. The backend allocator decides in which backend to spawn the VM based
-on the available resources of each backend, trying to balance the load between
-them. Also, Networks are created to all Ganeti backends, in order to ensure
-that VMs residing on different backends can be connected to the same networks.
+on the policies set and the available resources of each backend, trying to
+balance the load between them. Also, Networks are created to all Ganeti
+backends, in order to ensure that VMs residing on different backends can be
+connected to the same networks.
 
 A backend can be marked as `drained` in order to be excluded from automatic
 servers allocation and not receive new servers. Also, a backend can be marked
@@ -1046,10 +1068,12 @@ allocating new VMs to backends. This allocator does not choose the exact Ganeti
 node that will host the VM but just the Ganeti backend. The exact node is
 chosen by the Ganeti cluster's allocator (hail).
 
-The decision about which backend will host a VM is based on the available
-resources. The allocator computes a score for each backend, that shows its load
-factor, and the one with the minimum score is chosen. The admin can exclude
-backends from the allocation phase by marking them as ``drained`` by running:
+The decision about which backend will host a VM is based on the defined
+policies and the available resources. The default filter allocator filters the
+available backends based on the policy filters set and then computes a score
+for each backend, that shows its load factor. The one with the minimum
+score is chosen. The admin can exclude backends from the allocation phase by
+marking them as ``drained`` by running:
 
 .. code-block:: console
 
@@ -1072,10 +1096,11 @@ even if is marked as drained (useful for testing).
 Allocation based on disk-templates
 **********************************
 
-Besides the available resources of each Ganeti backend, the allocator takes
-into consideration the disk template of the instance when trying to allocate it
-to a Ganeti backend. Specifically, the allocator checks if the flavor of the
-instance belongs to the available disk templates of each Ganeti backend.
+Besides the filter policies and the available resources of each Ganeti backend,
+the allocator takes into consideration the disk template of the instance when
+trying to allocate it to a Ganeti backend. Specifically, the allocator checks
+if the flavor of the instance belongs to the available disk templates of each
+Ganeti backend.
 
 A Ganeti cluster has a list of enabled disk templates
 (`--enabled-disk-templates`) and a list of allowed disk templates for new
@@ -1094,6 +1119,89 @@ flavor disk template, by modifying the enabled or ipolicy disk templates of
 each backend.  Also, the administrator can route instances between different
 nodes of the same Ganeti backend, by modifying the same options at the
 nodegroup level (see `gnt-group` manpage for mor details).
+
+.. _alloc_custom_filter:
+
+Allocation based on custom filter
+*********************************
+The default Synnefo allocator is the FilterAllocator which filters the
+available backends based on a configurable list of filters. The administrator
+can modify the backend allocation process by implementing her own filter and
+injecting it into the FilterAllocator's filter chain.
+
+Each custom filter must be a subclass of the `FilterBase` class, located at
+`synnefo.logic.allocators.base`, and implement the `filter_backends` method.
+Then she can insert the custom filter on the filter chain by altering the
+`BACKEND_FILTER_ALLOCATOR_FILTERS` setting to include her own filter on the
+proper position on the list.
+
+The `filter_backends` method is used to filter the backends that the allocator
+can choose from. Altering this list, effectively affects the backends to be
+considered for allocation. It takes two arguments:
+
+1. A list of the available backends that have passed from the previous filters.
+   In the beginning, the process is initiated with all the available backends
+   (i.e. those that are neither drained nor offline).  Each backend is a django
+   object and an instance of the `Backend` model.
+
+2. A map with 4 keys representing the attributes of the VM to be allocated:
+
+   - `ram`: The size of the memory we want to allocate on the backend.
+   - `disk`: The size of the disk we want to allocate on the backend.
+   - `cpu`: The size of the CPU we want to allocate on the backend.
+   - `project`: The project of the VM we want to allocate.
+
+The method returns a list of backends that can be chosen as the VM's backend
+based on the filter's policy.
+
+Note that the disk template allocation policy is always applied irrespectively
+of `BACKEND_ALLOCATOR_MODULE` or the `BACKEND_FILTER_ALLOCATOR_FILTER`
+settings.
+
+Allocation based on custom allocator
+************************************
+
+In order to determine which ganeti cluster is best for allocating a
+virtual machine, the allocator uses two methods:
+
+- `filter_backends`
+- `allocate`
+
+The `filter_backends` method is used to filter the backends that the allocator
+shouldn't even consider. It takes two arguements:
+
+1. A list of the available backends. A backend is available if it is not drained
+   or offline. Each backend is a django object and an instance of the `Backend`
+   model.
+
+2. A map with 4 keys:
+
+   - `ram`: The size of the memory we want to allocate on the backend.
+   - `disk`: The size of the disk we want to allocate on the backend.
+   - `cpu`: The size of the CPU we want to allocate on the backend.
+   - `project`: The project of the VM we want to allocate.
+
+
+The `allocate` method returns the backend that will be used to allocate the virtual
+machine. It takes two arguements:
+
+1. A list of the available backends. A backend is available if it is not
+   drained or offline. Each backend is a django object and is an instance of
+   the `Backend` model.
+
+2. A map with 4 keys:
+
+    - `ram`: The size of the memory we want to allocate on the backend.
+    - `disk`: The size of the disk we want to allocate on the backend.
+    - `cpu`: The size of the CPU we want to allocate on the backend.
+    - `project`: The project of the VM we want to allocate.
+
+So the administrator can create his own allocation algorithm by creating a class
+that inherits the `AllocatorBase` located at `synnefo.logic.allocators.base`,
+and implements the above methods.
+
+If the administrator wants synnefo to use his allocation algorithm he just has to change
+the `BACKEND_ALLOCATOR_MODULE` setting to the path of his allocator class.
 
 Removing an existing Ganeti backend
 ```````````````````````````````````
@@ -1282,9 +1390,9 @@ Public IP accounting
 
 There are many use cases, e.g. abuse ports, where you need to find which user
 or which server had a public IP address. For this reason, Cyclades keeps track
-usage of public IPv4/IPv6 addresses. Specifically, it keeps the date and time
-that each public IP address was allocated and released from a virtual server.
-This information can be found using `ip-list` command:
+of the usage of public IPv4/IPv6 addresses. Specifically, when an IP address
+is attached to or detached from a virtual server, the timestamp of the
+action is logged. This information can be found using the `ip-list` command:
 
 .. code-block:: console
 
@@ -1418,20 +1526,30 @@ quota limits, dependent on the overlimit resource:
 * `cyclades.cpu`: Shutdown VMs
 * `cyclades.total_ram`: Delete VMs
 * `cyclades.ram`: Shutdown VMs
-* `cyclades.disk`: Delete VMs
-* `cyclades.floating_ip`: Detach and remove IPs
+* `cyclades.disk`: Delete volumes (may also trigger VM deletion)
+* `cyclades.floating_ip`: Detach and delete IPs
 
 VMs to be deleted/shutdown are chosen first by state in the following order:
 ERROR, BUILD, STOPPED, STARTED or RESIZE and then by decreasing ID. When
 needing to remove IPs, we first choose IPs that are free, then those
 attached to VMs, using the same VM ordering.
 
-By default, the command checks only the following resources: `cyclades.cpu`,
-`cyclades.ram`, and `cyclades.floating_ip`; that is, the less dangerous
-ones, those that do not result in *deleting* any VM. One can change the
-default behavior by specifying the desired resources with option
-``--resources``. It is also possible to specify users to be checked or
-excluded.
+You need to specify the resources to be checked, using the option
+``--resources``. A safe first attempt would be to specify
+``cyclades.cpu,cyclades.ram``, that is, to check the less dangerous resources,
+those that do not result in *deleting* any VM, volume, or IP.
+
+If you want to handle overlimit quota in a safer way for resources that
+would normally trigger a deletion, you can use the option
+``--soft-resources``. Enforcing e.g. `cyclades.vm` in a "soft" way will
+shutdown the VMs rather than deleting them. This is useful as an initial
+warning for a user who is overquota; but notice that the user may restart
+their shutdown VMs, if the resources that control starting VMs allows them
+to do so.
+
+With option ``--list-resources`` you can inspect the available resources
+along with the related standard and soft enforce actions. It is also
+possible to specify users and projects to be checked or excluded.
 
 Actual enforcement is done with option ``--fix``. In order to control the
 load that quota enforcement may cause on Cyclades, one can limit the number
@@ -1451,6 +1569,33 @@ expensive operations triggered by shutdown, such as Windows updates.
 The command outputs the list of applied actions and reports whether each
 action succeeded or not. Failure is reported if for any reason cyclades
 failed to process the job and submit it to the backend.
+
+Shared Resources
+~~~~~~~~~~~~~~~~
+
+Since version 0.17, it is possible to share resources among the members of
+the project that the resource belongs to.
+
+The owner of the resource can choose to grant full access to all users that are
+members of the project that the resource is charged to. Users will be able to
+see the resource and use it exactly as if they were the owners of the resource.
+For example, users will be able to restart or destroy a shared virtual server.
+
+The sharing mechanism suppports fine-grained granularity at the resource level,
+which means that you can share a resource (e.g. virtual server) without
+sharing related resources (e.g. volumes, floating IPs, etc.). This results
+to what we call "ghost resources", which are resources that are visible to a
+user only because they are somehow related with a shared resource, and the user
+has no access to them. For example, after sharing a volume that is attached to
+some server, project members will be able to see the server that the volume is
+attached to, but they will not have any access to the server.
+
+This is an optional feature which is by default disabled.  To enable the
+sharing functionality, the administrator must set the
+`CYCLADES_SHARED_RESOURCES_ENABLE` setting in
+`/etc/synnefo/20-snf-cyclades-app-api.conf` to `True`. After this, users
+will be able to grant/remove access from resources from the project reassign
+view in the web UI.
 
 Cyclades advanced operations
 ----------------------------
@@ -1939,7 +2084,7 @@ They are also available from our apt repository: ``apt.dev.grnet.gr``
  * `snf-astakos-app <http://www.synnefo.org/docs/astakos/latest/index.html>`_
  * `snf-pithos-backend <http://www.synnefo.org/docs/pithos/latest/backends.html>`_
  * `snf-pithos-app <http://www.synnefo.org/docs/pithos/latest/index.html>`_
- * `snf-pithos-webclient <http://www.synnefo.org/docs/pithos-webclient/latest/index.html>`_
+ * `snf-ui-app <http://www.synnefo.org/docs/ui/latest/index.html>`_
  * `snf-cyclades-app <http://www.synnefo.org/docs/snf-cyclades-app/latest/index.html>`_
  * `snf-cyclades-gtools <http://www.synnefo.org/docs/snf-cyclades-gtools/latest/index.html>`_
  * `snf-admin-app <http://www.synnefo.org/docs/snf-admin-app/latest/index.html>`_
@@ -2407,79 +2552,79 @@ best fits your needs.
 In order to overwrite one or more email-templates you need to place your
 modified <email-file>.txt files respecting the following structure:
 
-  **/etc/synnefo/templates/**
-      **im/**
-          | activation_email.txt
-          | email.txt
-          | invitation.txt
-          | switch_accounts_email.txt
-          | welcome_email.txt
-          **projects/**
-              | project_approval_notification.txt
-              | project_denial_notification.txt
-              | project_membership_change_notification.txt
-              | project_membership_enroll_notification.txt
-              | project_membership_leave_request_notification.txt
-              | project_membership_request_notification.txt
-              | project_suspension_notification.txt
-              | project_termination_notification.txt
-      **registration/**
-          | email_change_email.txt
-          | password_email.txt
+  | **/etc/synnefo/templates/**
+  |     **im/**
+  |           activation_email.txt
+  |           email.txt
+  |           invitation.txt
+  |           switch_accounts_email.txt
+  |           welcome_email.txt
+  |         **projects/**
+  |               project_approval_notification.txt
+  |               project_denial_notification.txt
+  |               project_membership_change_notification.txt
+  |               project_membership_enroll_notification.txt
+  |               project_membership_leave_request_notification.txt
+  |               project_membership_request_notification.txt
+  |               project_suspension_notification.txt
+  |               project_termination_notification.txt
+  |     **registration/**
+  |           email_change_email.txt
+  |           password_email.txt
 
 Feel free to omit any of the above files you do not wish to overwrite.
 
-Below is a list of all emails sent by Synnefo to users along with a short
+Below is a list of all the emails sent by Synnefo to users along with a short
 description and a link to their content:
 
 * ``snf-astakos-app/astakos/im/templates/im/email.txt``
   Base email template. Contains a contact email and a “thank you” message.
-  (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/email.txt>`_)
+  (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/email.txt>`__)
 * ``snf-astakos-app/astakos/im/templates/im/activation_email.txt`` Email sent to
   user that prompts  him/her to click on a link provided to activate the account.
-  Extends “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/activation_email.txt>`_)
+  Extends “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/activation_email.txt>`__)
 * ``snf-astakos-app/astakos/im/templates/im/invitation.txt`` Email sent to an
   invited user. He/she has to click on a link provided to activate the account.
-  Extends “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/invitation.txt>`_)
+  Extends “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/invitation.txt>`__)
 * ``snf-astakos-app/astakos/im/templates/im/switch_accounts_email.txt`` Email
   sent to user upon his/her request to associate this email address with a
   shibboleth account. He/she has to click on a link provided to activate the
-  association. Extends “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/switch_accounts_email.txt>`_)
+  association. Extends “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/switch_accounts_email.txt>`__)
 * ``snf-astakos-app/astakos/im/templates/im/welcome_email.txt`` Email sent to
   inform the user that his/ her account has been activated. Extends “email.txt”
-  (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/welcome_email.txt>`_)
+  (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/welcome_email.txt>`__)
 * ``snf-astakos-app/astakos/im/templates/registration/email_change_email.txt``
   Email sent to user when he/she has requested new email address assignment. The
   user has to click on a link provided to validate this action. Extends
-  “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/registration/email_change_email.txt>`_)
+  “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/registration/email_change_email.txt>`__)
 * ``snf-astakos-app/astakos/im/templates/registration/password_email.txt`` Email
   sent for resetting password purpose. The user has to click on a link provided
-  to validate this action. Extends “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/registration/password_email.txt>`_)
+  to validate this action. Extends “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/registration/password_email.txt>`__)
 * ``snf-astakos-app/astakos/im/templates/im/projects/project_approval_notification.txt``
   Informs  the project owner that his/her project has been approved. Extends
-  “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/projects/project_approval_notification.txt>`_)
+  “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/projects/project_approval_notification.txt>`__)
 * ``snf-astakos-app/astakos/im/templates/im/projects/project_denial_notification.txt``
   Informs the project owner that his/her  project application has been denied
-  explaining the reasons. Extends “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/projects/project_denial_notification.txt>`_)
+  explaining the reasons. Extends “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/projects/project_denial_notification.txt>`__)
 * ``snf-astakos-app/astakos/im/templates/im/projects/project_membership_change_notification.txt``
   An email is sent to a user containing information about his project membership
   (whether he has been accepted, rejected or removed). Extends “email.txt” (`Link
-  <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/projects/project_membership_change_notification.txt>`_)
+  <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/projects/project_membership_change_notification.txt>`__)
 * ``snf-astakos-app/astakos/im/templates/im/projects/project_membership_enroll_notification.txt``
   Informs a user that he/she  has been enrolled to a project. Extends
-  “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/projects/project_membership_enroll_notification.txt>`_)
+  “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/projects/project_membership_enroll_notification.txt>`__)
 * ``snf-astakos-app/astakos/im/templates/im/projects/project_membership_leave_request_notification.txt``
   An email is sent to the project owner to make him aware of a  user having
-  requested to leave his project. Extends “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/projects/project_membership_leave_request_notification.txt>`_)
+  requested to leave his project. Extends “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/projects/project_membership_leave_request_notification.txt>`__)
 * ``snf-astakos-app/astakos/im/templates/im/projects/project_membership_request_notification.txt``
   An email is sent to the project owner to make him/her aware of a user having
-  requested to join  his project. Extends “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/projects/project_membership_request_notification.txt>`_)
+  requested to join  his project. Extends “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/projects/project_membership_request_notification.txt>`__)
 * ``snf-astakos-app/astakos/im/templates/im/projects/project_suspension_notification.txt``
   An email is sent to the project owner to make him/her aware of his/her project
-  having been suspended. Extends “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/projects/project_suspension_notification.txt>`_)
+  having been suspended. Extends “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/projects/project_suspension_notification.txt>`__)
 * ``snf-astakos-app/astakos/im/templates/im/projects/project_termination_notification.txt``
   An email is sent to the project owner to make him/her aware of his/her project
-  having been terminated. Extends “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/projects/project_termination_notification.txt>`_)
+  having been terminated. Extends “email.txt” (`Link <https://github.com/grnet/synnefo/blob/master/snf-astakos-app/astakos/im/templates/im/projects/project_termination_notification.txt>`__)
 
 .. warning:: Django templates language:
 
@@ -2740,7 +2885,7 @@ Role **ASTAKOS_DB**
     * Synnefo components: `None`
     * 3rd party components: PostgreSQL
 Role **PITHOS**
-    * Synnefo components: `snf-webproject`, `snf-pithos-app`, `snf-pithos-webclient`
+    * Synnefo components: `snf-webproject`, `snf-pithos-app`, `snf-ui-app`
     * 3rd party components: Django, Gunicorn
 Role **PITHOS_DB**
     * Synnefo components: `None`
@@ -2796,7 +2941,7 @@ Node2:
         * :ref:`apache <i-apache>`
         * :ref:`snf-webproject <i-webproject>`
         * :ref:`snf-pithos-app <i-pithos>`
-        * :ref:`snf-pithos-webclient <i-pithos>`
+        * :ref:`snf-ui-app <i-pithos>`
 Node3:
     **WEBSERVER**, **CYCLADES**
       Guide sections:
@@ -2980,6 +3125,9 @@ Upgrade Notes
    v0.15 -> v0.15.1 <upgrade/upgrade-0.15.1>
    v0.15 -> v0.16 <upgrade/upgrade-0.16>
    v0.16.1 -> v0.16.2 <upgrade/upgrade-0.16.2>
+   v0.16.2 -> v0.17 <upgrade/upgrade-0.17>
+   v0.17 -> v0.18.1 <upgrade/upgrade-0.18.1>
+   v0.18.1 -> v0.19 <upgrade/upgrade-0.19>
 
 
 .. _changelog-news:
@@ -2987,7 +3135,9 @@ Upgrade Notes
 Changelog, NEWS
 ===============
 
-
+* v0.19 :ref:`Changelog <Changelog-0.19>`, :ref:`NEWS <NEWS-0.19>`
+* v0.18.1 :ref:`Changelog <Changelog-0.18.1>`, :ref:`NEWS <NEWS-0.18.1>`
+* v0.17 :ref:`Changelog <Changelog-0.17>`, :ref:`NEWS <NEWS-0.17>`
 * v0.16.2 :ref:`Changelog <Changelog-0.16.2>`, :ref:`NEWS <NEWS-0.16.2>`
 * v0.16.1 :ref:`Changelog <Changelog-0.16.1>`, :ref:`NEWS <NEWS-0.16.1>`
 * v0.16 :ref:`Changelog <Changelog-0.16>`, :ref:`NEWS <NEWS-0.16>`

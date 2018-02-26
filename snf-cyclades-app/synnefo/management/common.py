@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2017 GRNET S.A.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -17,7 +17,8 @@ from django.core.management import CommandError
 from synnefo.db.models import (Backend, VirtualMachine, Network,
                                Flavor, IPAddress, Subnet,
                                BridgePoolTable, MacPrefixPoolTable,
-                               NetworkInterface, Volume, VolumeType)
+                               NetworkInterface, Volume, VolumeType,
+                               ProjectBackend, FlavorAccess)
 from functools import wraps
 
 from django.conf import settings
@@ -40,6 +41,7 @@ def format_vm_state(vm):
     else:
         return vm.operstate
 
+
 RESOURCE_MAP = {
     "backend": Backend.objects,
     "flavor": Flavor.objects,
@@ -49,7 +51,9 @@ RESOURCE_MAP = {
     "subnet": Subnet.objects,
     "port": NetworkInterface.objects,
     "floating-ip": IPAddress.objects.filter(floating_ip=True),
-    "volume-type": VolumeType.objects}
+    "volume-type": VolumeType.objects,
+    "project-backend": ProjectBackend.objects,
+    "flavor-access": FlavorAccess.objects}
 
 
 def get_resource(name, value, for_update=False):

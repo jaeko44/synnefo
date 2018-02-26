@@ -19,15 +19,17 @@ import logging
 from django.core.exceptions import ObjectDoesNotExist, MultipleObjectsReturned
 
 from astakos.im.models import AstakosUser
-from synnefo.db.models import IPAddress, IPAddressLog
+from synnefo.db.models import IPAddress, IPAddressHistory
 
 from synnefo_admin.admin.exceptions import AdminHttp404
 from synnefo_admin.admin.utils import create_details_href
 
 
-def get_ip_or_404(query):
+def get_ip_or_404(query, for_update=False):
+    ip_object = IPAddress.objects.select_for_update() if for_update\
+            else IPAddress.objects
     try:
-        return IPAddress.objects.get(address=query)
+        return ip_object.get(address=query)
     except ObjectDoesNotExist:
         pass
     except MultipleObjectsReturned:
@@ -35,13 +37,13 @@ def get_ip_or_404(query):
                            entries for this address: %s""" % query)
 
     try:
-        return IPAddress.objects.get(pk=int(query))
+        return ip_object.get(pk=int(query))
     except (ObjectDoesNotExist, ValueError):
-        # Check the IPAddressLog and inform the user that the IP existed at
+        # Check the IPAddressHistory and inform the user that the IP existed at
         # sometime.
         msg = "No IP was found that matches this query: %s" % query
         try:
-            if IPAddressLog.objects.filter(address=query).exists():
+            if IPAddressHistory.objects.filter(address=query).exists():
                 msg = """This IP was deleted. Check the "IP History" tab for
                 more details."""
         except ObjectDoesNotExist:
@@ -62,7 +64,7 @@ def get_contact_name(inst):
 def get_user_details_href(ip):
     if ip.userid:
         user = AstakosUser.objects.get(uuid=ip.userid)
-        return create_details_href('user', user.realname, user.email)
+        return create_details_href('user', user.realname, user.email, user.uuid)
     else:
         return "-"
 

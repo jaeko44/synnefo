@@ -105,9 +105,16 @@ def main():  # pylint: disable=too-many-statements, too-many-branches
                            " Supports both search by name (reg expression)"
                            " with \"name:image name\" or by id with"
                            " \"id:image id\".")
+    parser.add_option("--no-agent", dest="no_agent",
+                      default=None, action="store_true",
+                      help="Tell the SSH layer not to seek out running SSH"
+                           " agents when using key-based authentication")
     parser.add_option("--ssh-keys", dest="ssh_keys", default=None,
                       help="Upload/Install the public ssh keys contained"
                            " in this file to the server")
+    parser.add_option("--local-package-dir", dest="local_package_dir",
+                      default=None, help="Upload local packages from this dir "
+                      "to the server")
     parser.add_option("--name", dest="server_name", default=None,
                       help="")
     parser.add_option("-n", "--build-id", dest="build_id", default=None,
@@ -181,6 +188,7 @@ def main():  # pylint: disable=too-many-statements, too-many-branches
     # Initialize SynnefoCi
     utils.USE_COLORS = options.use_colors
     utils.IGNORE_SSL = options.ignore_ssl
+    utils.SSH_NO_AGENT = options.no_agent
     config_file = options.config_file
     if config_file is not None:
         config_file = os.path.expanduser(config_file)
@@ -198,12 +206,12 @@ def main():  # pylint: disable=too-many-statements, too-many-branches
                                  image=options.image,
                                  ssh_keys=options.ssh_keys,
                                  server_name=options.server_name)
+    if getattr(options, BUILD_SYNNEFO_CMD, False):
         synnefo_ci.clone_repo(
             synnefo_repo=options.synnefo_repo,
             synnefo_branch=options.synnefo_branch,
             local_repo=options.local_repo,
             pull_request=options.pull_request)
-    if getattr(options, BUILD_SYNNEFO_CMD, False):
         synnefo_ci.build_packages()
         if options.fetch_packages:
             dest = os.path.abspath(options.fetch_packages)
@@ -214,7 +222,8 @@ def main():  # pylint: disable=too-many-statements, too-many-branches
             dest = os.path.abspath(options.fetch_docs)
             synnefo_ci.fetch_documentation(dest=dest)
     if getattr(options, DEPLOY_SYNNEFO_CMD, False):
-        synnefo_ci.deploy_synnefo(schema=options.schema)
+        synnefo_ci.deploy_synnefo(schema=options.schema,
+                                  local_package_dir=options.local_package_dir)
     if getattr(options, TEST_SYNNEFO_CMD, False):
         synnefo_ci.unit_test()
     if getattr(options, RUN_BURNIN_CMD, False):

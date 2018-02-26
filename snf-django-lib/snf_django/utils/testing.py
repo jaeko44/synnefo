@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2017 GRNET S.A. and individual contributors
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -15,10 +15,42 @@
 
 
 from contextlib import contextmanager
-from django.test import TestCase
-from django.utils import simplejson as json
+from django.test import TransactionTestCase
+import json
 from django.utils.encoding import smart_unicode
 from mock import patch
+import functools
+
+
+class MurphysLaw(Exception):
+
+    """Exception for test purposes.
+
+    This exception should be used in mock functions. It simulates a generic
+    error during a function call that would need a transaction rollback or
+    clean up code to ensure that the system remains in a sane state.
+
+    While no different than a common exception, it makes all the difference
+    when used in conjuction with "assertRaises". Consider the scenario where we
+    want to test the function `foo` and we have added an exception at some
+    point:
+
+    >>> with self.assertRaise(Exception):
+    ...     foo()
+    ... # Check that the foo function left no side-effects
+
+    If foo happened to have an error at some other point that would cause some
+    other exception to be raised, then we would falsely continue with the test.
+    Therefore, we need a special exception to make sure that foo crashed at the
+    point we wanted to. This is a better solution:
+
+    >>> with self.assertRaise(MurphysLaw):
+    ...     foo()
+    ... # Check that the foo function left no side-effects
+
+    """
+
+    pass
 
 
 @contextmanager
@@ -59,7 +91,7 @@ def override_settings(settings, **kwargs):
     """
 
     _prefix = kwargs.get('prefix', '')
-    prefix = lambda key: '%s%s' % (_prefix, key)
+    prefix = lambda key: '%s%s' % (_prefix, key)  # noqa: E731
 
     oldkeys = [k for k in dir(settings) if k.upper() == k]
     oldsettings = dict([(k, getattr(settings, k)) for k in oldkeys])
@@ -81,7 +113,7 @@ def override_settings(settings, **kwargs):
     if kwargs.get('reset_changes', True):
         newkeys = [k for k in dir(settings) if k.upper() == k]
         for key in newkeys:
-            if not key in oldkeys:
+            if key not in oldkeys:
                 delattr(settings, key)
 
     # Revert old keys
@@ -92,6 +124,10 @@ def override_settings(settings, **kwargs):
 
 def with_settings(settings, prefix='', **override):
     def wrapper(func):
+        # The use of wraps is required here. Without it, the name of a "test_"
+        # function that gets decorated by "with_settings" would become "inner"
+        # and nose would not detect it as a test function.
+        @functools.wraps(func)
         def inner(*args, **kwargs):
             with override_settings(settings, prefix=prefix, **override):
                 ret = func(*args, **kwargs)
@@ -99,11 +135,12 @@ def with_settings(settings, prefix='', **override):
         return inner
     return wrapper
 
+
 serial = 0
 
 
 @contextmanager
-def astakos_user(user):
+def astakos_user(user, projects=None, roles=None):
     """
     Context manager to mock astakos response.
 
@@ -114,6 +151,8 @@ def astakos_user(user):
     """
     with patch("snf_django.lib.api.get_token") as get_token:
         get_token.return_value = "DummyToken"
+        if roles is None:
+            roles = [{"id": 1, "name": "default"}]
         with patch('astakosclient.AstakosClient.authenticate') as m2:
             m2.return_value = {"access": {
                 "token": {
@@ -128,7 +167,8 @@ def astakos_user(user):
                 "user": {
                     "roles_links": [],
                     "id": smart_unicode(user, encoding='utf-8'),
-                    "roles": [{"id": 1, "name": "default"}],
+                    "roles": roles,
+                    "projects": projects,
                     "name": "Firstname Lastname"}}
                 }
 
@@ -203,21 +243,24 @@ def mocked_quotaholder(success=True):
         yield astakos.return_value
 
 
-class BaseAPITest(TestCase):
+class BaseAPITest(TransactionTestCase):
     def get(self, url, user='user', *args, **kwargs):
-        with astakos_user(user):
+        with astakos_user(user, kwargs.pop('_projects', None),
+                          kwargs.pop('_roles', None)):
             with mocked_quotaholder():
                 response = self.client.get(url, *args, **kwargs)
         return response
 
     def head(self, url, user='user', *args, **kwargs):
-        with astakos_user(user):
+        with astakos_user(user, kwargs.pop('_projects', None),
+                          kwargs.pop('_roles', None)):
             with mocked_quotaholder():
                 response = self.client.head(url, *args, **kwargs)
         return response
 
-    def delete(self, url, user='user'):
-        with astakos_user(user):
+    def delete(self, url, user='user', **kwargs):
+        with astakos_user(user, kwargs.pop('_projects', None),
+                          kwargs.pop('_roles', None)):
             with mocked_quotaholder() as m:
                 self.mocked_quotaholder = m
                 response = self.client.delete(url)
@@ -226,7 +269,8 @@ class BaseAPITest(TestCase):
     def post(self, url, user='user', params={}, ctype='json', *args, **kwargs):
         if ctype == 'json':
             content_type = 'application/json'
-        with astakos_user(user):
+        with astakos_user(user, kwargs.pop('_projects', None),
+                          kwargs.pop('_roles', None)):
             with mocked_quotaholder() as m:
                 self.mocked_quotaholder = m
                 response = self.client.post(url, params,
@@ -237,7 +281,8 @@ class BaseAPITest(TestCase):
     def put(self, url, user='user', params={}, ctype='json', *args, **kwargs):
         if ctype == 'json':
             content_type = 'application/json'
-        with astakos_user(user):
+        with astakos_user(user, kwargs.pop('_projects', None),
+                          kwargs.pop('_roles', None)):
             with mocked_quotaholder() as m:
                 self.mocked_quotaholder = m
                 response = self.client.put(url, params,
@@ -249,8 +294,20 @@ class BaseAPITest(TestCase):
         self.assertTrue(response.status_code in [200, 202, 203, 204],
                         msg=response.content)
 
+    def assertSuccess200(self, response):
+        self.assertEqual(response.status_code, 200, msg=response.content)
+
     def assertSuccess201(self, response):
         self.assertEqual(response.status_code, 201, msg=response.content)
+
+    def assertSuccess202(self, response):
+        self.assertEqual(response.status_code, 202, msg=response.content)
+
+    def assertSuccess203(self, response):
+        self.assertEqual(response.status_code, 203, msg=response.content)
+
+    def assertSuccess204(self, response):
+        self.assertEqual(response.status_code, 204, msg=response.content)
 
     def assertFault(self, response, status_code, name, msg=''):
         self.assertEqual(response.status_code, status_code,
@@ -275,6 +332,9 @@ class BaseAPITest(TestCase):
         except ValueError:
             self.assertTrue(False)
         self.assertEqual(error['notAllowed']['message'], 'Method not allowed')
+
+    def assertForbidden(self, response):
+        self.assertFault(response, 403, 'forbidden', msg=response.content)
 
 
 # Imitate unittest assertions new in Python 2.7

@@ -25,7 +25,7 @@ from django.utils.html import escape
 
 from astakos.im.models import Resource
 from synnefo.db.models import (VirtualMachine, Volume, Network, IPAddress,
-                               IPAddressLog)
+                               IPAddressHistory)
 from astakos.im.models import AstakosUser, Project, ProjectApplication
 
 from synnefo.util import units
@@ -46,7 +46,7 @@ model_dict = {
     "volume": Volume,
     "network": Network,
     "ip": IPAddress,
-    "ip_log": IPAddressLog,
+    "ip_log": IPAddressHistory,
     "project": Project,
     "application": ProjectApplication,
 }
@@ -232,12 +232,12 @@ def send_admin_email(user, request):
                text=body)
 
 
-def create_details_href(type, name, id):
+def create_details_href(type, name, id, uuid=None):
     """Create an href (name + url) for an item."""
     name = escape(name)
     url = reverse('admin-details', args=[type, id])
     if type == 'user':
-        href = '<a href=%s>%s (%s)</a>' % (url, name, id)
+        href = '<a href=%s>%s | %s | %s </a>' % (url, uuid, name, id)
     elif type == 'ip':
         href = '<a href=%s>%s</a>' % (url, name)
     else:

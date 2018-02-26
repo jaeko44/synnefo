@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2017 GRNET S.A. and individual contributors
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -13,6 +13,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import re
+
 from base64 import urlsafe_b64encode, b64decode
 from urllib import quote
 from hashlib import sha256
@@ -25,17 +27,19 @@ from Crypto.Cipher import AES
 from django.conf import settings
 from django.http import HttpResponse
 from django.template.loader import render_to_string
-from django.utils import simplejson as json
-from django.db.models import Q
+import json
+from django.core.cache import caches
 
 from snf_django.lib.api import faults
 from synnefo.db.models import (Flavor, VirtualMachine, VirtualMachineMetadata,
                                Network, NetworkInterface, SecurityGroup,
                                BridgePoolTable, MacPrefixPoolTable, IPAddress,
                                IPPoolTable)
+from synnefo.userdata.models import PublicKeyPair
 from synnefo.plankton.backend import PlanktonBackend
 
-from synnefo.cyclades_settings import cyclades_services, BASE_HOST
+from synnefo.cyclades_settings import cyclades_services, BASE_HOST,\
+    PUBLIC_STATS_CACHE_NAME, VM_PASSWORD_CACHE_NAME
 from synnefo.lib.services import get_service_path
 from synnefo.lib import join_urls
 
@@ -61,6 +65,26 @@ FLOATING_IPS_URL = join_urls(NETWORK_URL, "floatingips/")
 PITHOSMAP_PREFIX = "pithosmap://"
 
 log = getLogger('synnefo.api')
+
+
+def build_version_object(url, version_id, path, status, **extra_args):
+    """Generates a version object
+
+    The version object is structured based on the OpenStack
+    API. `extra_args` is for supporting extra information about
+    the version such as media types, extra links etc
+    """
+    base_version = {
+        'id': 'v%s' % version_id,
+        'status': status,
+        'links': [
+            {
+                'rel': 'self',
+                'href': '%s/%s/' % (url, path),
+            },
+        ],
+    }
+    return dict(base_version, **extra_args)
 
 
 def random_password():
@@ -110,12 +134,14 @@ def stats_encrypt(plaintext):
     return quote(urlsafe_b64encode(enc))
 
 
-def get_vm(server_id, user_id, for_update=False, non_deleted=False,
-           non_suspended=False, prefetch_related=None):
-    """Find a VirtualMachine instance based on ID and owner."""
+def get_random_helper_vm(for_update=False, prefetch_related=None):
+    """Find a random helper VirtualMachine instance.
 
+    This function will fetch a random helper vm that resides in an online,
+    undrained Ganeti backend. For security reasons, we require the status of
+    the VM to be "STOPPED".
+    """
     try:
-        server_id = int(server_id)
         servers = VirtualMachine.objects
         if for_update:
             servers = servers.select_for_update()
@@ -124,7 +150,35 @@ def get_vm(server_id, user_id, for_update=False, non_deleted=False,
                 servers = servers.prefetch_related(*prefetch_related)
             else:
                 servers = servers.prefetch_related(prefetch_related)
-        vm = servers.get(id=server_id, userid=user_id)
+
+        vms = servers.filter(helper=True, backend__offline=False,
+                             backend__drained=False,
+                             operstate="STOPPED")
+        return choice(vms)
+    except IndexError, VirtualMachine.DoesNotExist:
+        raise faults.ItemNotFound('Helper server not found.')
+
+
+def get_vm(server_id, user_id, projects, for_update=False,
+           non_deleted=False, non_suspended=False, prefetch_related=None):
+    """Find a VirtualMachine instance based on ID and owner."""
+
+    try:
+        server_id = int(server_id)
+
+        servers = VirtualMachine.objects.for_user(userid=user_id,
+                                                  projects=projects)
+
+        if for_update:
+            servers = servers.select_for_update()
+        if prefetch_related is not None:
+            if isinstance(prefetch_related, list):
+                servers = servers.prefetch_related(*prefetch_related)
+            else:
+                servers = servers.prefetch_related(prefetch_related)
+
+        vm = servers.get(id=server_id)
+
         if non_deleted and vm.deleted:
             raise faults.BadRequest("Server has been deleted.")
         if non_suspended and vm.suspended:
@@ -155,6 +209,19 @@ def get_image(image_id, user_id):
             raise faults.ItemNotFound("Image '%s' not found" % image_id)
 
 
+def get_keypair(keypair_name, user_id, for_update=False):
+    try:
+        keypairs = PublicKeyPair.objects
+        if for_update:
+            keypairs = keypairs.select_for_update()
+        keypair = keypairs.get(name=keypair_name, user=user_id)
+        if keypair.deleted:
+            raise faults.BadRequest("Keypair has been deleted.")
+        return keypair
+    except PublicKeyPair.DoesNotExist:
+        raise faults.ItemNotFound('Keypair %s not found.' % keypair_name)
+
+
 def get_image_dict(image_id, user_id):
     image = {}
     img = get_image(image_id, user_id)
@@ -179,7 +246,7 @@ def get_image_dict(image_id, user_id):
     return image
 
 
-def get_flavor(flavor_id, include_deleted=False):
+def get_flavor(flavor_id, include_deleted=False, for_project=None, user=None):
     """Return a Flavor instance or raise ItemNotFound."""
 
     try:
@@ -187,23 +254,48 @@ def get_flavor(flavor_id, include_deleted=False):
         flavors = Flavor.objects.select_related("volume_type")
         if not include_deleted:
             flavors = flavors.filter(deleted=False)
-        return flavors.get(id=flavor_id)
+        flavor = flavors.get(id=flavor_id)
+        if not has_access_to_flavor(flavor, project=for_project, user=user):
+            raise faults.Forbidden("Insufficient access")
+        return flavor
     except (ValueError, TypeError):
         raise faults.BadRequest("Invalid flavor ID '%s'" % flavor_id)
     except Flavor.DoesNotExist:
         raise faults.ItemNotFound('Flavor not found.')
 
 
-def get_network(network_id, user_id, for_update=False, non_deleted=False):
+def has_access_to_flavor(flavor, project=None, user=None):
+    """Return True if the flavor is public or a project has access to the
+       flavor or the specified user has VMs using this flavor.
+    """
+    if flavor.public:
+        return True
+    if project is not None:
+        if not isinstance(project, list):
+            project = [project]
+        if flavor.access.filter(project__in=project).count() > 0:
+            return True
+    if user is not None:
+        # XXX: Should this include also the case where the VM is shared to the
+        # project, in which it is not owned by the particular user ?
+        if flavor.virtual_machines.filter(userid=user).count() > 0:
+            return True
+    return False
+
+
+def get_network(network_id, user_id, projects, for_update=False,
+                non_deleted=False):
     """Return a Network instance or raise ItemNotFound."""
 
     try:
         network_id = int(network_id)
-        objects = Network.objects
+
+        objects = Network.objects.for_user(user_id, projects)
         if for_update:
             objects = objects.select_for_update()
-        network = objects.get(Q(userid=user_id) | Q(public=True),
-                              id=network_id)
+
+        network = objects.get(id=network_id)
+
         if non_deleted and network.deleted:
             raise faults.BadRequest("Network has been deleted.")
         return network
@@ -213,17 +305,18 @@ def get_network(network_id, user_id, for_update=False, non_deleted=False):
         raise faults.ItemNotFound('Network %s not found.' % network_id)
 
 
-def get_port(port_id, user_id, for_update=False):
+def get_port(port_id, user_id, projects, for_update=False):
     """
     Return a NetworkInteface instance or raise ItemNotFound.
     """
     try:
-        objects = NetworkInterface.objects.filter(userid=user_id)
-        if for_update:
-            objects = objects.select_for_update()
+        objects = NetworkInterface.objects.for_user(user_id, projects)
         # if (port.device_owner != "vm") and for_update:
         #     raise faults.BadRequest('Cannot update non vm port')
-        return objects.get(id=port_id)
+        port = objects.get(id=port_id)
+        if for_update:
+            port = NetworkInterface.objects.select_for_update().get(id=port_id)
+        return port
     except (ValueError, TypeError):
         raise faults.BadRequest("Invalid port ID '%s'" % port_id)
     except NetworkInterface.DoesNotExist:
@@ -238,25 +331,28 @@ def get_security_group(sg_id):
         raise faults.ItemNotFound("Not valid security group")
 
 
-def get_floating_ip_by_address(userid, address, for_update=False):
+def get_floating_ip_by_address(userid, projects, address, for_update=False):
     try:
-        objects = IPAddress.objects
+        objects = IPAddress.objects.for_user(userid, projects)\
+                                   .filter(floating_ip=True, deleted=False)
         if for_update:
             objects = objects.select_for_update()
-        return objects.get(userid=userid, floating_ip=True,
-                           address=address, deleted=False)
+
+        return objects.get(address=address)
     except IPAddress.DoesNotExist:
         raise faults.ItemNotFound("Floating IP does not exist.")
 
 
-def get_floating_ip_by_id(userid, floating_ip_id, for_update=False):
+def get_floating_ip_by_id(userid, projects, floating_ip_id, for_update=False):
     try:
         floating_ip_id = int(floating_ip_id)
-        objects = IPAddress.objects
+
+        objects = IPAddress.objects.for_user(userid, projects)\
+                                   .filter(floating_ip=True, deleted=False)
         if for_update:
             objects = objects.select_for_update()
-        return objects.get(id=floating_ip_id, floating_ip=True,
-                           userid=userid, deleted=False)
+
+        return objects.get(id=floating_ip_id)
     except IPAddress.DoesNotExist:
         raise faults.ItemNotFound("Floating IP with ID %s does not exist." %
                                   floating_ip_id)
@@ -455,3 +551,51 @@ def start_action(vm, action, jobId):
     vm.backendjobstatus = None
     vm.backendlogmsg = None
     vm.save()
+
+
+STATS_CACHE_VALUES = {
+    'spawned_servers':
+    lambda: VirtualMachine.objects.exclude(operstate="ERROR").count(),
+    'active_servers':
+    lambda:
+    VirtualMachine.objects.exclude(operstate__in=["DELETED", "ERROR"]).count(),
+    'spawned_networks':
+    lambda: Network.objects.exclude(state__in=["ERROR", "PENDING"]).count(),
+}
+
+
+def get_or_set_cache(cache, key, func):
+    value = cache.get(key)
+    if value is None:
+        value = func()
+        cache.set(key, value)
+    return value
+
+
+public_stats_cache = caches[PUBLIC_STATS_CACHE_NAME]
+
+
+def get_cached_public_stats():
+    results = {}
+    for key, func in STATS_CACHE_VALUES.iteritems():
+        results[key] = get_or_set_cache(public_stats_cache, key, func)
+    return results
+
+
+VM_PASSWORD_CACHE = caches[VM_PASSWORD_CACHE_NAME]
+
+
+def can_create_flavor(flavor, user):
+    policy = getattr(settings, 'CYCLADES_FLAVOR_OVERRIDE_ALLOW_CREATE', {})
+    if not policy or flavor.allow_create:
+        return flavor.allow_create
+
+    groups = map(lambda g: g['name'], user['access']['user'].get('roles', []))
+    policy_groups = policy.keys()
+    common = set(policy_groups).intersection(groups)
+    for group in common:
+        allowed_flavors = policy[group]
+        for flv in allowed_flavors:
+            if re.compile(flv).match(flavor.name):
+                return True
+    return False

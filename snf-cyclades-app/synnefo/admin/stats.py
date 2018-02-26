@@ -1,4 +1,4 @@
-# Copyright (C) 2010-2014 GRNET S.A.
+# Copyright (C) 2010-2016 GRNET S.A.
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -24,6 +24,7 @@ from django.db.models import Count, Sum
 
 from snf_django.lib.astakos import UserCache
 from synnefo.plankton.backend import PlanktonBackend
+from synnefo.api.util import get_cached_public_stats
 from synnefo.db.models import (VirtualMachine, Network, Backend, VolumeType,
                                pooled_rapi_client, Flavor)
 
@@ -265,6 +266,9 @@ def get_public_stats():
     statistics = {"servers": server_stats,
                   "networks": network_stats}
     return statistics
+
+def get_public_stats_from_cache():
+    return get_cached_public_stats()
 
 
 if __name__ == "__main__":
